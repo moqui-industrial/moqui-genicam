@@ -57,6 +57,11 @@
         permissionEnumId="PpeReadWrite"
         description="Controls the acquisition rate in frames per second"/>
 
+    <moqui.math.ParameterDef parameterDefId="FLIR_BFS_LatestFrame"
+        parameterCode="LatestFrame" parameterName="LatestFrame" parameterTypeEnumId="PtText"
+        permissionEnumId="PpeRead"
+        description="File path of the latest acquired camera frame (JPEG/PNG)"/>
+
     <!-- Live Parameter values representing active state on FLIR_CAMERA_1 -->
     <moqui.math.Parameter parameterId="11001" parameterDefId="FLIR_BFS_ExposureTime" deviceId="FLIR_CAMERA_1" sequenceNum="1" numericValue="5000.0"/>
     <moqui.math.Parameter parameterId="11002" parameterDefId="FLIR_BFS_Gain" deviceId="FLIR_CAMERA_1" sequenceNum="2" numericValue="0.0"/>
@@ -66,6 +71,7 @@
     <moqui.math.Parameter parameterId="11006" parameterDefId="FLIR_BFS_AcquisitionStart" deviceId="FLIR_CAMERA_1" sequenceNum="6" symbolicValue="Execute"/>
     <moqui.math.Parameter parameterId="11007" parameterDefId="FLIR_BFS_AcquisitionStop" deviceId="FLIR_CAMERA_1" sequenceNum="7" symbolicValue="Execute"/>
     <moqui.math.Parameter parameterId="11008" parameterDefId="FLIR_BFS_AcquisitionFrameRate" deviceId="FLIR_CAMERA_1" sequenceNum="8" numericValue="30.0"/>
+    <moqui.math.Parameter parameterId="11009" parameterDefId="FLIR_BFS_LatestFrame" deviceId="FLIR_CAMERA_1" sequenceNum="9" symbolicValue=""/>
 
     <!-- Device connection mapping to CTI driver path -->
     <moqui.device.DeviceConnection connectionName="FlirCameraConnection" deviceId="FLIR_CAMERA_1"
@@ -110,4 +116,12 @@
         runServiceName="moqui.genicam.GenicamServices.run#GenICamRequest" timeout="5000" onlyChangedParameters="N"/>
     <moqui.device.DeviceRequestItem requestName="FLIR_StopStreaming" parameterId="11007"
         sequenceNum="1" query="AcquisitionStop" itemTypeEnumId="DritString"/>
+
+    <!-- 5. Read Request (Get Latest Frame) -->
+    <moqui.device.DeviceRequest requestName="FLIR_GetFrame" deviceId="FLIR_CAMERA_1" priority="5"
+        purposeEnumId="DrpMonitoring" routerEnumId="DrrDirect" connectionName="FlirCameraConnection"
+        requestTypeEnumId="DrtRead"
+        runServiceName="moqui.genicam.GenicamServices.run#GenICamRequest" timeout="5000"/>
+    <moqui.device.DeviceRequestItem requestName="FLIR_GetFrame" parameterId="11009"
+        sequenceNum="1" query="LatestFrame" itemTypeEnumId="DritString"/>
 </entity-facade-xml>

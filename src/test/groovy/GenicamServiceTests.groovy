@@ -15,7 +15,7 @@ class GenicamServiceTests extends Specification {
     @Shared ExecutionContext ec
 
     def setupSpec() {
-        // Ensure database is initialized and seed/test data is loaded
+        // ensure database is initialized and seed/test data is loaded
         Moqui.getExecutionContextFactory().checkEmptyDb()
         ec = Moqui.getExecutionContext()
         ec.user.loginUser("john.doe", "moqui")
@@ -81,5 +81,55 @@ class GenicamServiceTests extends Specification {
             
             long logEntries = ec.entity.find("moqui.math.ParameterLog").condition("parameterId", "11005").count()
             logEntries > 0
+    }
+
+    def "test start and stop camera streaming (mock fallback)"() {
+        given: "the streaming requests exist"
+            EntityValue startReq = ec.entity.find("moqui.device.DeviceRequest")
+                .condition("requestName", "FLIR_StartStreaming").one()
+            EntityValue stopReq = ec.entity.find("moqui.device.DeviceRequest")
+                .condition("requestName", "FLIR_StopStreaming").one()
+            assert startReq != null && stopReq != null
+
+        when: "triggering the start streaming request"
+            ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
+                .parameter("requestName", "FLIR_StartStreaming").call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        when: "triggering the stop streaming request"
+            ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
+                .parameter("requestName", "FLIR_StopStreaming").call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+    }
+
+    def "test read latest frame (mock fallback)"() {
+        given: "starting the background stream"
+            ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
+                .parameter("requestName", "FLIR_StartStreaming").call()
+            assert !ec.message.hasError()
+
+        when: "fetching the latest frame"
+            ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
+                .parameter("requestName", "FLIR_GetFrame").call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        and: "the LatestFrame parameter is updated with a valid file path"
+            EntityValue latestFrameParam = ec.entity.find("moqui.math.Parameter").condition("parameterId", "11009").one()
+            String filePath = latestFrameParam.symbolicValue
+            assert filePath != null && filePath.endsWith(".jpg")
+
+        and: "the saved JPEG image exists on the filesystem and is non-empty"
+            File imageFile = new File(filePath)
+            assert imageFile.exists() && imageFile.length() > 0
+
+        cleanup: "stopping the stream to clean up the acquisition thread"
+            ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
+                .parameter("requestName", "FLIR_StopStreaming").call()
     }
 }

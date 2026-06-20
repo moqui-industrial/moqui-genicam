@@ -20,7 +20,7 @@
 
             ExecutionContext ec = context.ec
             
-            // Resolve camera serial number and driver path
+            // resolve camera serial number and driver path
             String ctiPath = connection.transportConfig
             if (!ctiPath) {
                 throw new IllegalArgumentException("Connection transportConfig must specify the absolute path to the .cti GenTL driver.")
@@ -40,14 +40,14 @@
                 serialNumber = connection.connectionName
             }
 
-            // Get JEP tool factory
+            // get JEP tool factory
             final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
             
-            // Execute the action (Read or Write)
+            // execute the action (Read or Write)
             Map<String, Object> pyResults = [:]
             
             try (Interpreter interpreter = tool.getInterpreter()) {
-                // Add the component's script directory to Python path
+                // add the component's script directory to Python path
                 URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
                 String scriptDir = ""
                 if (scriptUrl != null) {
@@ -73,7 +73,7 @@
                 interpreter.exec("import sys")
                 interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
                 
-                // Set parameters for python script
+                // set parameters for python script
                 interpreter.set("cti_path", ctiPath)
                 interpreter.set("serial_number", serialNumber)
                 
@@ -121,10 +121,10 @@
                 throw t
             }
 
-            // Sync Python results back to Moqui DB parameters
+            // sync Python results back to Moqui DB parameters
             if (pyResults) {
                 pyResults.each { String key, Object val ->
-                    // Find the request item corresponding to this node query
+                    // find the request item corresponding to this node query
                     EntityValue item = requestItemList.find { it.query == key }
                     if (item) {
                         EntityValue parameter = ec.entity.find("moqui.math.Parameter")
@@ -140,10 +140,10 @@
                                 parameter.numericValue = null
                                 parameter.symbolicValue = val?.toString()
                             }
-                            // Save live parameter state
+                            // save live parameter state
                             parameter.update()
                             
-                            // Log the observation
+                            // log the observation
                             long nextSeq = ec.entity.find("moqui.math.ParameterLog")
                                 .condition("parameterId", parameter.parameterId)
                                 .count() + 1
@@ -186,11 +186,11 @@
 
             ExecutionContext ec = context.ec
             
-            // Resolve PhysicalDevice
+            // resolve PhysicalDevice
             EntityValue device = ec.entity.find("moqui.device.Device").condition("deviceId", deviceId).one()
             if (!device) throw new IllegalArgumentException("Device not found with ID: ${deviceId}")
             
-            // Resolve Connection
+            // resolve Connection
             EntityValue connection = null
             if (connectionName) {
                 connection = ec.entity.find("moqui.device.DeviceConnection").condition("connectionName", connectionName).one()
@@ -213,7 +213,7 @@
             }
             if (!serialNumber) serialNumber = connection.connectionName
 
-            // Get JEP tool factory
+            // get JEP tool factory
             final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
             Map<String, Object> pyResults = [:]
             
@@ -256,6 +256,102 @@
             }
 
             acquiredFrames = pyResults?.get("acquired_frames")
+        ]]></script></actions>
+    </service>
+
+    <service verb="stream" noun="LiveMjpeg" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceId" required="true"/>
+            <parameter name="connectionName"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            import org.moqui.context.ExecutionContext
+            import org.moqui.impl.tools.JepToolFactory
+            import jep.Interpreter
+            import org.moqui.entity.EntityValue
+            import jakarta.servlet.http.HttpServletResponse
+            import java.io.OutputStream
+
+            ExecutionContext ec = context.ec
+            if (!ec.web) {
+                throw new IllegalStateException("This service must be called in a web request context.")
+            }
+
+            EntityValue device = ec.entity.find("moqui.device.Device").condition("deviceId", deviceId).one()
+            if (!device) throw new IllegalArgumentException("Device not found: ${deviceId}")
+
+            EntityValue connection = connectionName ? 
+                ec.entity.find("moqui.device.DeviceConnection").condition("connectionName", connectionName).one() :
+                ec.entity.find("moqui.device.DeviceConnection").condition("deviceId", deviceId).one()
+            if (!connection) throw new IllegalArgumentException("Connection not found for device: ${deviceId}")
+
+            String ctiPath = connection.transportConfig
+            String serialNumber = device.serialNumber ?: connection.connectionName
+
+            final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+
+            HttpServletResponse response = (HttpServletResponse) ec.web.response
+            response.setContentType("multipart/x-mixed-replace; boundary=frame")
+            response.setHeader("Cache-Control", "no-cache, private, must-revalidate")
+            response.setHeader("Pragma", "no-cache")
+            response.setHeader("Connection", "keep-alive")
+
+            OutputStream os = response.getOutputStream()
+
+            try (Interpreter interpreter = tool.getInterpreter()) {
+                URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
+                String scriptDir = ""
+                if (scriptUrl != null) {
+                    try {
+                        scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
+                    } catch (Throwable t) {
+                        scriptDir = scriptUrl.getPath()
+                        if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
+                        if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
+                    }
+                }
+                if (!scriptDir) {
+                    scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
+                    if (scriptDir.startsWith("file:")) {
+                        scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
+                    }
+                }
+                scriptDir = scriptDir.replace('\\', '/')
+                
+                interpreter.exec("import sys")
+                interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
+                interpreter.exec("import genicam_bridge")
+
+                interpreter.set("cti_path", ctiPath)
+                interpreter.set("serial_number", serialNumber)
+
+                // stream 100 frames (~7 seconds) as a safety-net limit for testing, or until client disconnects
+                int maxFrames = 100
+                int frameCount = 0
+                
+                while (frameCount < maxFrames) {
+                    interpreter.exec("result = genicam_bridge.run_action('get_frame', cti_path, serial_number)")
+                    Map pyRes = (Map) interpreter.getValue("result")
+                    byte[] jpegBytes = (byte[]) pyRes?.get("jpeg_bytes")
+
+                    if (jpegBytes) {
+                        try {
+                            os.write(("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + jpegBytes.length + "\r\n\r\n").getBytes())
+                            os.write(jpegBytes)
+                            os.write("\r\n".getBytes())
+                            os.flush()
+                        } catch (IOException ioEx) {
+                            ec.logger.info("Live stream client disconnected for camera ${serialNumber}")
+                            break
+                        }
+                    }
+                    frameCount++
+                    Thread.sleep(66) // ~15 FPS
+                }
+            } catch (Throwable t) {
+                ec.logger.error("GenICam Live MJPEG stream error", t)
+                throw t
+            }
         ]]></script></actions>
     </service>
 </services>

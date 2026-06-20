@@ -1,30 +1,57 @@
 # moqui-genicam
 
-`moqui-genicam` is a data-driven integration component for the Moqui Framework. It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via **JEP** (Java Embedded Python) and the Python **Harvesters** library.
+`moqui-genicam` is a **model-first** and **data-driven** integration component for the Moqui Framework. It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via **JEP** (Java Embedded Python) and the Python **Harvesters** library.
+
+---
+
+## Model-First & Data-Driven Philosophy
+
+In traditional systems, integrating machine vision cameras requires proprietary SDKs and custom, hardcoded wrappers. When parameters like exposure time, trigger source, or resolution need to change, developers are forced to write new code, rebuild, and redeploy.
+
+`moqui-genicam` eliminates this coupling by treating cameras, configurations, and commands entirely as **data**:
+
+*   **Model-First Digital Twin**: The system models physical cameras as database entities (`moqui.device.Device` and `moqui.device.PhysicalDevice`). You configure the camera profile, capability sets, and physical parameters as structured records.
+*   **Data-Driven Node Mapping**: Every camera feature (e.g., `ExposureTime`, `Gain`, `TriggerMode`) is mapped to a database definition (`moqui.math.ParameterDef`). Moqui uses these definitions to dynamically execute read and write requests without requiring hardcoded setter or getter methods for each parameter.
+*   **Zero Code Generation**: Adding support for a new camera model or exposure parameter is as simple as inserting database seed data (XML files like `GenicamTestData.xml`). The core integration code remains unchanged and generic.
+*   **Decoupled Parameter Logs**: Physical camera states are continuously tracked. Real-time values map to `moqui.math.Parameter`, while historical states are saved to `moqui.math.ParameterLog` for telemetry audits.
+
+---
+
+## Core Features & Enhancements
+
+This component includes major runtime enhancements designed for production-grade machine vision deployments:
+
+### 1. OpenCV-Backed Pixel Format Conversion
+The Python bridge dynamically reads raw camera buffer components and converts them into standard BGR/JPEG format using **OpenCV**. It supports:
+- **Mono8** (grayscale)
+- **RGB8 / BGR8** (color channels)
+- **Bayer patterns** (`BayerRG8`, `BayerGR8`, `BayerGB8`, `BayerBG8`) with high-fidelity color reconstruction.
+
+### 2. Continuous Asynchronous Live Streaming
+- A background `AcquisitionThread` handles non-blocking image acquisition at the target frame rate.
+- Streaming is initiated via database write requests (`AcquisitionStart=Execute`) and stopped via (`AcquisitionStop=Execute`).
+- Cached frames are stored in memory and synchronized to disk upon request (`LatestFrame`).
+
+### 3. Multi-Component Payload Support
+- Handles multi-channel/multi-planar payloads by looping through all components inside the Harvesters buffer, allowing multi-modal imaging (e.g., combined 2D and 3D sensor streams).
+
+### 4. Resilient Reconnection & Backoff Engine
+- Protects against network drops or temporary camera power cycles.
+- Automatically attempts connection recovery up to 3 times with exponential backoff (e.g., 1s, 2s, 4s delays) before propagating errors.
+
+### 5. MJPEG Live Video Endpoint
+- Includes the `stream#LiveMjpeg` service inside [GenicamServices.xml](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/service/moqui/genicam/GenicamServices.xml).
+- Pushes live frames directly to HTTP responses using the `multipart/x-mixed-replace` MIME type, compatible with web browsers.
 
 ---
 
 ## The GenICam Standard
 
-**GenICam** (Generic Interface for Cameras) is the global standard administered by the European Machine Vision Association (EMVA). It provides a generic software interface for all kinds of cameras, regardless of the underlying physical interface (GigE Vision, USB3 Vision, CoaXPress, Camera Link, etc.) or the camera manufacturer. 
+**GenICam** (Generic Interface for Cameras) is the global standard administered by the European Machine Vision Association (EMVA). It provides a generic software interface for all kinds of cameras, regardless of the physical link (GigE Vision, USB3 Vision, CoaXPress, Camera Link) or vendor.
 
-The standard consists of three main modules:
-1. **GenApi**: A standardized XML description file format (typically embedded in the camera's non-volatile memory) that describes all the camera's features (such as `ExposureTime`, `Gain`, `TriggerMode`, `ImageWidth`) as hierarchical nodes, detailing their access modes, ranges, and types.
-2. **GenTL**: The GenICam Transport Layer, which handles physical communication and enumerates devices using producer drivers (`.cti` libraries).
-3. **SFNC**: The Standard Features Naming Convention, which ensures that standard features (like trigger control or exposure time) use the same node names across different camera brands.
-
-By leveraging GenICam, `moqui-genicam` can interact with any camera that supplies a GenTL driver and standard GenApi node definitions, eliminating manufacturer lock-in.
-
----
-
-## Data-Driven Philosophy with `moqui-device`
-
-Traditionally, camera integrations rely on hardcoded SDK wrappers, forcing developers to compile and deploy brand-specific code to adjust basic settings. `moqui-genicam` breaks this paradigm by employing a fully **data-driven design** built on Moqui's native `moqui-device` and `moqui-math` models:
-
-*   **Digital Twin representation**: The database defines what the camera is. A catalog model (`moqui.device.Device`) specifies the camera's capabilities, while a physical instance (`moqui.device.PhysicalDevice`) tracks the hardware instance deployed in the field (serial number, model name, vendor name).
-*   **Metadata over Code**: Camera parameters (e.g., exposure time, gain, pixel format) are declared as database records (`moqui.math.ParameterDef`). Features like min/max boundaries and read/write permission types (`PpeReadWrite`, `PpeWrite`) are fetched directly from the database, allowing Moqui to validate recipe configurations (recipes or configurations defined via `DeviceConfig`) before sending commands to the physical camera.
-*   **Decoupled parameter states**: The physical value of a parameter at any point in time is decoupled from the camera connection itself. Current states are captured in `moqui.math.Parameter`, and historical variations are tracked in `moqui.math.ParameterLog`.
-*   **No Code Generation**: Adding support for a new camera model or new camera parameters is as simple as inserting database seeds (XML files like `GenicamTestData.xml`). The core execution engine remains untouched.
+1.  **GenApi**: An XML file format embedded in the camera describing feature nodes.
+2.  **GenTL**: The Transport Layer for hardware communication via producer drivers (`.cti`).
+3.  **SFNC**: Standard Features Naming Convention to ensure standard feature names are consistent across brands.
 
 ---
 
@@ -51,21 +78,11 @@ flowchart TD
     DB -->|Update Parameter / ParameterLog| Client
 ```
 
-### How it Works (Common to PLC4J and GenICam)
-
-1.  **DeviceRequest (The Action Boundary)**: 
-    An execution is triggered by calling a specific `DeviceRequest` (e.g., `FLIR_ReadState`, `FLIR_TriggerShot`). The request defines the intent (Read, Write, or Cyclic) and links to a specific `DeviceConnection`.
-2.  **DeviceRequestItem (The Query Mapping)**: 
-    Each request contains multiple items (`DeviceRequestItem`). The items act as a translator:
-    *   They link a Moqui `Parameter` (e.g., `ParameterId 11001` representing Exposure Time) to a protocol-specific **Query String**.
-    *   In **`moqui-plc4j`**, the Query String translates to a PLC address (e.g., `holding-register:2:UINT` or `STATE/9000:REAL`).
-    *   In **`moqui-genicam`**, the Query String translates to a GenICam node name (e.g., `ExposureTime`, `Gain`, `TriggerSoftware`).
-3.  **Protocol-Specific Runner**:
-    The core `run#DeviceRequest` engine routes the operation to the target component's implementation based on the driver declared in `DeviceConnection` (e.g. `genicam` vs `modbus` or `simulated`). 
-    *   `moqui-plc4j` resolves registers via Apache PLC4J and maps the bytes to decimal/boolean fields.
-    *   `moqui-genicam` resolves JEP, runs `genicam_bridge.py` using standard python mapping, and syncs numeric or symbolic properties.
-4.  **Automatic Synchronization & Auditing**:
-    Once the values are read or written, the driver updates `moqui.math.Parameter` and appends entries to `moqui.math.ParameterLog`. This ensures a uniform historical record of telemetry and commands across all sensors, PLCs, and cameras in the factory.
+### How it Works
+1.  **DeviceRequest (The Action Boundary)**: Runs target actions (e.g., `FLIR_ReadState`, `FLIR_StartStreaming`).
+2.  **DeviceRequestItem (The Query Mapping)**: Translates database parameter IDs (e.g., `11001` Exposure Time) to GenICam nodes (e.g. `ExposureTime`).
+3.  **JEP Execution Bridge**: Runs the python bridge which interfaces with the hardware and reports values back.
+4.  **Automatic Synchronization**: Automatically writes results back to the Moqui database entities.
 
 ---
 
@@ -73,10 +90,11 @@ flowchart TD
 
 *   **`component.xml`**: Declares module dependencies (`moqui-math`, `moqui-device`, `moqui-jep`).
 *   **`build.gradle`**: Builds, configures JEP environment, and manages testing libraries (Spock).
-*   **`data/GenicamTestData.xml`**: Seed data containing definitions for the `FLIR BFS-PGE-120S6C-C` camera, including connection settings and requests.
+*   **`data/GenicamTestData.xml`**: Seed data containing definitions for the `FLIR BFS-PGE-120S6C-C` camera, including connection settings, streaming control parameters, and requests.
 *   **`script/genicam_bridge.py`**: Python script handling Harvesters interactions and GenICam node mappings, with a JSON-based file fallback mock camera simulation for hardware-less testing.
 *   **`service/moqui/genicam/GenicamServices.xml`**: Groovy execution engine using JEP to run the Python bridge and map outputs back to the database.
-*   **`src/test/groovy/GenicamServiceTests.groovy`**: Spock integration tests validating read and write behaviors under mock mode.
+*   **`src/test/groovy/GenicamServiceTests.groovy`**: Spock integration tests validating read, write, streaming, and frame capture behaviors under mock mode.
+*   **`requirements.txt`**: Declares Python dependencies (`opencv-python`).
 
 ---
 

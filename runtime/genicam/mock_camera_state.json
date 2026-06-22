@@ -3,5 +3,7 @@
     "Gain": 0.0,
     "TriggerMode": "On",
     "TriggerSource": "Software",
-    "TriggerSoftware": "Executed"
+    "TriggerSoftware": "Executed",
+    "AcquisitionStart": "Execute",
+    "AcquisitionStop": "Execute"
 }

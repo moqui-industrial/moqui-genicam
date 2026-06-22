@@ -66,6 +66,15 @@ _latest_frames_lock = threading.Lock()
 _streaming_threads = {} # serial_number -> AcquisitionThread
 _streaming_threads_lock = threading.Lock()
 
+def _is_mock(cti_path, serial_number):
+    if not HAS_HARVESTERS:
+        return True
+    if not cti_path or not os.path.exists(cti_path):
+        return True
+    if serial_number == "FLIR_CAMERA_1" or "mock" in str(serial_number).lower():
+        return True
+    return False
+
 class CameraConnection:
     def __init__(self, cti_path, serial_number):
         self.cti_path = cti_path
@@ -88,6 +97,8 @@ class CameraConnection:
                 self.harvester.add_file(self.cti_path)
                 self.harvester.update()
                 self.acquirer = self.harvester.create_image_acquirer(serial_number=self.serial_number)
+                if self.acquirer is None:
+                    raise ConnectionError(f"No camera found with serial number {self.serial_number}")
                 logger.info(f"Successfully connected to camera {self.serial_number}")
                 return
             except Exception as e:
@@ -123,7 +134,7 @@ def get_connection(cti_path, serial_number):
         _connections_cache[key] = CameraConnection(cti_path, serial_number)
     
     conn = _connections_cache[key]
-    if HAS_HARVESTERS:
+    if not _is_mock(cti_path, serial_number):
         conn.connect()
     return conn
 
@@ -301,7 +312,7 @@ def handle_3d_payload(buffer):
 def acquire_3d_frame(cti_path, serial_number):
     logger.info(f"Acquiring 3D frame from camera {serial_number}")
     try:
-        if not HAS_HARVESTERS:
+        if _is_mock(cti_path, serial_number):
             if "invalid" in str(cti_path) or "fail" in str(cti_path):
                 raise ConnectionError("Simulated camera connection failure for testing.")
             buffer = _generate_mock_3d_buffer()
@@ -514,7 +525,7 @@ class AcquisitionThread(threading.Thread):
         backoff = 1.0
         
         while self.running:
-            if not HAS_HARVESTERS:
+            if _is_mock(self.cti_path, self.serial_number):
                 # Mock acquisition loop
                 try:
                     time.sleep(0.1) # Simulate 10 FPS
@@ -595,7 +606,7 @@ class AcquisitionThread(threading.Thread):
                         pass
         
         logger.info(f"Background acquisition thread stopped for camera {self.serial_number}")
-        if HAS_HARVESTERS:
+        if not _is_mock(self.cti_path, self.serial_number):
             try:
                 key = (self.cti_path, self.serial_number)
                 if key in _connections_cache:
@@ -658,7 +669,7 @@ def read_camera_parameters(cti_path, serial_number, parameter_names):
             result[name] = _write_latest_frame_file(serial_number)
             continue
             
-        if not HAS_HARVESTERS:
+        if _is_mock(cti_path, serial_number):
             # Mock mode
             mock_state = _get_mock_state()
             result[name] = mock_state.get(name, None)
@@ -699,7 +710,7 @@ def write_camera_parameters(cti_path, serial_number, parameters_map):
         
     result = {}
     for name, value in parameters_map.items():
-        if not HAS_HARVESTERS:
+        if _is_mock(cti_path, serial_number):
             # Mock mode
             mock_state = _get_mock_state()
             if name == "TriggerSoftware":
@@ -759,7 +770,7 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
     logger.info(f"Acquiring video stream of {num_frames} frames from camera {serial_number}")
     os.makedirs(output_dir, exist_ok=True)
     
-    if not HAS_HARVESTERS:
+    if _is_mock(cti_path, serial_number):
         # Mock video stream
         mock_files = []
         for i in range(num_frames):

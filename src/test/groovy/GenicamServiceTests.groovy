@@ -132,4 +132,96 @@ class GenicamServiceTests extends Specification {
             ec.service.sync().name("moqui.device.DeviceServices.run#DeviceRequest")
                 .parameter("requestName", "FLIR_StopStreaming").call()
     }
+
+    def "test acquire 3D frame (mock fallback)"() {
+        when: "calling the acquire#GenICam3DFrame service"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#GenICam3DFrame")
+                .parameter("deviceId", "FLIR_CAMERA_1").call()
+            
+        then: "no errors are raised"
+            !ec.message.hasError()
+            
+        and: "a valid tensorId and tensorContentId are returned"
+            res.tensorId != null
+            res.tensorContentId != null
+            res.contentLocation != null
+            
+        and: "the tensor record is created in the database with correct rank and shape"
+            EntityValue tensor = ec.entity.find("moqui.math.Tensor").condition("tensorId", res.tensorId).one()
+            tensor != null
+            tensor.tensorTypeEnumId == "TtDense"
+            tensor.purposeEnumId == "TpImageRep"
+            tensor.rank == 3
+            tensor.shape == "[480, 640, 3]"
+            tensor.size == 480 * 640 * 3
+            
+        and: "the saved tensor .npy file exists on the filesystem and is non-empty"
+            File npyFile = new File(res.contentLocation)
+            npyFile.exists()
+            npyFile.length() > 0
+    }
+
+    def "test clean tensors service job"() {
+        given: "a tensor file and DB record exist"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#GenICam3DFrame")
+                .parameter("deviceId", "FLIR_CAMERA_1").call()
+            assert !ec.message.hasError()
+            
+            String tensorId = res.tensorId
+            String contentLocation = res.contentLocation
+            assert new File(contentLocation).exists()
+            
+        when: "calling clean#GenICamTensors with daysToKeep=0 to force deletion"
+            ec.service.sync().name("moqui.genicam.GenicamServices.clean#GenICamTensors")
+                .parameter("daysToKeep", 0).call()
+                
+        then: "no errors are raised"
+            !ec.message.hasError()
+            
+        and: "the tensor file is deleted from filesystem"
+            !new File(contentLocation).exists()
+            
+        and: "the tensor DB records are deleted"
+            ec.entity.find("moqui.math.Tensor").condition("tensorId", tensorId).one() == null
+            ec.entity.find("moqui.math.TensorContent").condition("tensorId", tensorId).one() == null
+            ec.entity.find("moqui.math.TensorAxis").condition("tensorId", tensorId).count() == 0
+    }
+
+    def "test device error status change on failure"() {
+        given: "a device and connection with invalid transport config"
+            EntityValue conn = ec.entity.find("moqui.device.DeviceConnection")
+                .condition("connectionName", "FlirCameraConnection").one()
+            assert conn != null
+            String originalConfig = conn.transportConfig
+            
+            // Set device status to Standstill initially
+            EntityValue device = ec.entity.find("moqui.device.Device").condition("deviceId", "FLIR_CAMERA_1").one()
+            device = device.cloneValue()
+            device.statusId = "DbsStandstill"
+            device.update()
+            
+        when: "triggering acquire 3D frame with an invalid config path"
+            conn = conn.cloneValue()
+            conn.transportConfig = "invalid_path.cti"
+            conn.update()
+            
+            try {
+                ec.service.sync().name("moqui.genicam.GenicamServices.acquire#GenICam3DFrame")
+                    .parameter("deviceId", "FLIR_CAMERA_1").call()
+            } catch (Exception e) {
+                // Expected to fail
+            }
+            
+        then: "the device status in DB transitions to DbsErrorStop"
+            EntityValue updatedDevice = ec.entity.find("moqui.device.Device")
+                .condition("deviceId", "FLIR_CAMERA_1").one()
+            updatedDevice.statusId == "DbsErrorStop"
+            
+        cleanup: "restore the original connection transport config"
+            if (conn != null && originalConfig != null) {
+                conn = conn.cloneValue()
+                conn.transportConfig = originalConfig
+                conn.update()
+            }
+    }
 }

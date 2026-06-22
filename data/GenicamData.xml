@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<entity-facade-xml type="seed">
+    <!-- Scheduled Service Job for Cleaning Old ToF Tensors -->
+    <moqui.service.job.ServiceJob jobName="clean_GenICamTensors_daily" description="Clean Old GenICam 3D ToF Tensors"
+            serviceName="moqui.genicam.GenicamServices.clean#GenICamTensors" cronExpression="0 0 2 * * ?" paused="N">
+        <parameters parameterName="daysToKeep" parameterValue="30"/>
+    </moqui.service.job.ServiceJob>
+</entity-facade-xml>

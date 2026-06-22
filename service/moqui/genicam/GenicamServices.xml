@@ -76,6 +76,8 @@
                 // set parameters for python script
                 interpreter.set("cti_path", ctiPath)
                 interpreter.set("serial_number", serialNumber)
+                interpreter.set("device_id", device.deviceId)
+                interpreter.set("ec", ec)
                 
                 if ("DrtRead" == request.requestTypeEnumId) {
                     List<String> paramNames = requestItemList*.query
@@ -85,7 +87,7 @@
                     
                     ec.logger.info("Executing JEP GenICam Read request for camera ${serialNumber}")
                     interpreter.exec("import genicam_bridge")
-                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameter_names=parameter_names)")
+                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameter_names=parameter_names, ec=ec, device_id=device_id)")
                     
                     pyResults = (Map<String, Object>) interpreter.getValue("result")
                     
@@ -110,7 +112,7 @@
                     
                     ec.logger.info("Executing JEP GenICam Write request for camera ${serialNumber} with parameters: ${paramsMap}")
                     interpreter.exec("import genicam_bridge")
-                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map)")
+                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map, ec=ec, device_id=device_id)")
                     
                     pyResults = (Map<String, Object>) interpreter.getValue("result")
                 } else {
@@ -173,7 +175,7 @@
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
             <parameter name="numFrames" type="Integer" default="10"/>
-            <parameter name="outputDir" default="runtime/genicam/frames"/>
+            <parameter name="outputDir" default-value="runtime/genicam/frames"/>
         </in-parameters>
         <out-parameters>
             <parameter name="acquiredFrames" type="List"/>
@@ -241,13 +243,15 @@
                 
                 interpreter.set("cti_path", ctiPath)
                 interpreter.set("serial_number", serialNumber)
+                interpreter.set("device_id", deviceId)
+                interpreter.set("ec", ec)
                 interpreter.set("action", "video")
                 interpreter.set("parameter_names", null)
                 interpreter.set("parameters_map", [num_frames: numFrames, output_dir: outputDir])
                 
                 ec.logger.info("Executing JEP GenICam Video Stream request for camera ${serialNumber}")
                 interpreter.exec("import genicam_bridge")
-                interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map)")
+                interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map, ec=ec, device_id=device_id)")
                 
                 pyResults = (Map<String, Object>) interpreter.getValue("result")
             } catch (Throwable t) {
@@ -324,13 +328,15 @@
 
                 interpreter.set("cti_path", ctiPath)
                 interpreter.set("serial_number", serialNumber)
+                interpreter.set("device_id", deviceId)
+                interpreter.set("ec", ec)
 
                 // stream 100 frames (~7 seconds) as a safety-net limit for testing, or until client disconnects
                 int maxFrames = 100
                 int frameCount = 0
                 
                 while (frameCount < maxFrames) {
-                    interpreter.exec("result = genicam_bridge.run_action('get_frame', cti_path, serial_number)")
+                    interpreter.exec("result = genicam_bridge.run_action('get_frame', cti_path, serial_number, ec=ec, device_id=device_id)")
                     Map pyRes = (Map) interpreter.getValue("result")
                     byte[] jpegBytes = (byte[]) pyRes?.get("jpeg_bytes")
 
@@ -352,6 +358,170 @@
                 ec.logger.error("GenICam Live MJPEG stream error", t)
                 throw t
             }
+        ]]></script></actions>
+    </service>
+
+    <service verb="acquire" noun="GenICam3DFrame" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceId" required="true"/>
+            <parameter name="connectionName"/>
+            <parameter name="outputDir" default-value="runtime/genicam/tensors"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tensorId"/>
+            <parameter name="tensorContentId"/>
+            <parameter name="contentLocation"/>
+        </out-parameters>
+        <actions><script><![CDATA[
+            import org.moqui.context.ExecutionContext
+            import org.moqui.impl.tools.JepToolFactory
+            import jep.Interpreter
+            import org.moqui.entity.EntityValue
+            import java.io.File
+
+            ExecutionContext ec = context.ec
+            
+            // Resolve PhysicalDevice
+            EntityValue device = ec.entity.find("moqui.device.Device").condition("deviceId", deviceId).one()
+            if (!device) throw new IllegalArgumentException("Device not found with ID: ${deviceId}")
+            
+            // Resolve Connection
+            EntityValue connection = null
+            if (connectionName) {
+                connection = ec.entity.find("moqui.device.DeviceConnection").condition("connectionName", connectionName).one()
+            } else {
+                connection = ec.entity.find("moqui.device.DeviceConnection").condition("deviceId", deviceId).one()
+            }
+            if (!connection) throw new IllegalArgumentException("Connection not found for device: ${deviceId}")
+
+            String ctiPath = connection.transportConfig
+            if (!ctiPath) throw new IllegalArgumentException("Connection transportConfig must specify driver path.")
+            
+            String serialNumber = device.serialNumber
+            if (connection.options) {
+                Map optsMap = [:]
+                connection.options.split(",")*.trim().each {
+                    def parts = it.split("=")
+                    if (parts.length == 2) optsMap.put(parts[0], parts[1])
+                }
+                if (optsMap.serial) serialNumber = optsMap.serial
+            }
+            if (!serialNumber) serialNumber = connection.connectionName
+
+            // Get JEP tool factory
+            final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+            Map<String, Object> pyResults = [:]
+            
+            try (Interpreter interpreter = tool.getInterpreter()) {
+                URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
+                String scriptDir = ""
+                if (scriptUrl != null) {
+                    try {
+                        scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
+                    } catch (Throwable t) {
+                        scriptDir = scriptUrl.getPath()
+                        if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
+                        if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
+                    }
+                }
+                if (!scriptDir) {
+                    scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
+                    if (scriptDir.startsWith("file:")) {
+                        scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
+                    }
+                }
+                scriptDir = scriptDir.replace('\\', '/')
+                interpreter.exec("import sys")
+                interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
+                
+                interpreter.set("cti_path", ctiPath)
+                interpreter.set("serial_number", serialNumber)
+                interpreter.set("device_id", deviceId)
+                interpreter.set("output_dir", outputDir)
+                interpreter.set("ec", ec)
+                interpreter.set("action", "acquire_3d_frame")
+                
+                ec.logger.info("Executing JEP GenICam acquire_3d_frame for camera ${serialNumber}")
+                interpreter.exec("import genicam_bridge")
+                interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, ec=ec, device_id=device_id)")
+                
+                pyResults = (Map<String, Object>) interpreter.getValue("result")
+            } catch (Throwable t) {
+                ec.logger.error("GenICam JEP 3D frame acquisition failed", t)
+                throw t
+            }
+
+            if (pyResults) {
+                tensorId = pyResults.get("tensorId")
+                tensorContentId = pyResults.get("tensorContentId")
+                contentLocation = pyResults.get("contentLocation")
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="clean" noun="GenICamTensors" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="daysToKeep" type="Integer" default-value="30"/>
+            <parameter name="outputDir" default-value="runtime/genicam/tensors"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            import org.moqui.context.ExecutionContext
+            import org.moqui.entity.EntityValue
+            import org.moqui.entity.EntityCondition
+            import java.sql.Timestamp
+            import java.io.File
+
+            ExecutionContext ec = context.ec
+            
+            long keepMillis = daysToKeep * 24 * 60 * 60 * 1000L
+            Timestamp thresholdDate = new Timestamp(System.currentTimeMillis() - keepMillis)
+            
+            ec.logger.info("Cleaning up GenICam ToF tensors older than ${thresholdDate} (daysToKeep=${daysToKeep})...")
+            
+            // Find TensorContent older than threshold
+            List<EntityValue> oldContents = ec.entity.find("moqui.math.TensorContent")
+                .condition("contentDate", EntityCondition.LESS_THAN, thresholdDate)
+                .condition("contentTypeEnumId", "TCntNpy")
+                .list()
+                
+            int deletedCount = 0
+            for (EntityValue content in oldContents) {
+                String filePath = content.contentLocation
+                if (filePath) {
+                    File file = new File(filePath)
+                    if (file.exists()) {
+                        try {
+                            file.delete()
+                            ec.logger.info("Deleted old tensor file: ${filePath}")
+                        } catch (Exception e) {
+                            ec.logger.error("Failed to delete tensor file ${filePath}: ${e.getMessage()}")
+                        }
+                    }
+                }
+                
+                String tensorId = content.tensorId
+                
+                // Perform DB deletions programmatically in a transaction to maintain integrity
+                boolean beganTx = ec.transaction.begin(null)
+                try {
+                    // Delete TensorContent
+                    content.delete()
+                    
+                    // Delete TensorAxis
+                    ec.entity.find("moqui.math.TensorAxis").condition("tensorId", tensorId).deleteAll()
+                    
+                    // Delete Tensor
+                    ec.entity.find("moqui.math.Tensor").condition("tensorId", tensorId).deleteAll()
+                    
+                    ec.transaction.commit(beganTx)
+                    deletedCount++
+                } catch (Throwable t) {
+                    ec.transaction.rollback(beganTx, "Failed to clean tensor DB records", t)
+                    ec.logger.error("Failed to delete DB records for tensor ${tensorId}: ${t.getMessage()}")
+                }
+            }
+            
+            ec.logger.info("Successfully cleaned up ${deletedCount} old ToF tensors.")
         ]]></script></actions>
     </service>
 </services>

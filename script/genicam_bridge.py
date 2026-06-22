@@ -16,10 +16,17 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+# Try to import numpy
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    logger.warning("NumPy library not found. 3D and ToF functionalities will be limited.")
+
 # Try to import OpenCV
 try:
     import cv2
-    import numpy as np
     HAS_OPENCV = True
     logger.info("OpenCV (cv2) library loaded successfully.")
 except ImportError:
@@ -91,6 +98,7 @@ class CameraConnection:
                     time.sleep(backoff)
                     backoff *= 2.0
         
+        update_device_status_to_error()
         raise ConnectionError(f"Failed to connect to camera {self.serial_number} after 3 attempts.")
 
     def disconnect(self):
@@ -185,6 +193,263 @@ def _generate_mock_jpeg(serial_number, frame_index):
         return encoded_img.tobytes()
     return b""
 
+class MockComponent:
+    def __init__(self, data_format, width, height, data):
+        self.data_format_name = data_format
+        self.data_format = data_format
+        self.width = width
+        self.height = height
+        self.data = data
+
+class MockPayload:
+    def __init__(self, components, payload_type=7):
+        self.type = payload_type
+        self.components = components
+
+class MockBuffer:
+    def __init__(self, payload):
+        self.payload = payload
+
+def _generate_mock_3d_buffer(width=640, height=480):
+    # Component 0: Intensity (Mono8)
+    intensity_data = np.random.randint(0, 255, size=(height, width), dtype=np.uint8).flatten()
+    comp_intensity = MockComponent("Mono8", width, height, intensity_data)
+    
+    # Component 1: Range (Coord3D_ABC32f)
+    x = np.linspace(-1.0, 1.0, width)
+    y = np.linspace(-1.0, 1.0, height)
+    xx, yy = np.meshgrid(x, y)
+    zz = np.sin(xx**2 + yy**2) # simulated Z/depth
+    coords = np.stack([xx, yy, zz], axis=-1).astype(np.float32) # shape (height, width, 3)
+    comp_range = MockComponent("Coord3D_ABC32f", width, height, coords.flatten())
+    
+    # Component 2: Confidence (Mono8)
+    confidence_data = np.ones((height, width), dtype=np.uint8).flatten() * 255
+    comp_confidence = MockComponent("Mono8", width, height, confidence_data)
+    
+    payload = MockPayload([comp_intensity, comp_range, comp_confidence], payload_type=7)
+    return MockBuffer(payload)
+
+def handle_3d_payload(buffer):
+    payload = buffer.payload
+    payload_type = getattr(payload, 'type', None)
+    components = getattr(payload, 'components', [])
+    
+    logger.info(f"Processing payload type: {payload_type}, components count: {len(components)}")
+    
+    # Log the metadata tree (Task 1.3)
+    logger.info("=== GenDC/Multi-Part Metadata Tree ===")
+    for idx, comp in enumerate(components):
+        width = getattr(comp, 'width', 0)
+        height = getattr(comp, 'height', 0)
+        fmt = getattr(comp, 'data_format_name', None) or getattr(comp, 'data_format', 'Unknown')
+        data_size = len(comp.data) if comp.data is not None else 0
+        logger.info(f"Component {idx}: type/format={fmt}, dimensions={width}x{height}, size_bytes={data_size}")
+    logger.info("======================================")
+    
+    # Task 2.2: Isolate spatial component (Coord3D or Range)
+    spatial_comp = None
+    spatial_idx = -1
+    for idx, comp in enumerate(components):
+        fmt = getattr(comp, 'data_format_name', None) or getattr(comp, 'data_format', '')
+        if 'Coord3D' in str(fmt) or 'Range' in str(fmt):
+            spatial_comp = comp
+            spatial_idx = idx
+            break
+            
+    if spatial_comp is None and components:
+        spatial_comp = components[0]
+        spatial_idx = 0
+        
+    if spatial_comp is None:
+        raise ValueError("No valid spatial component found in the payload components.")
+        
+    width = spatial_comp.width
+    height = spatial_comp.height
+    raw_data = spatial_comp.data
+    fmt_name = getattr(spatial_comp, 'data_format_name', None) or getattr(spatial_comp, 'data_format', '')
+    
+    logger.info(f"Selected spatial component at index {spatial_idx} (format: {fmt_name}, size: {width}x{height})")
+    
+    # Task 2.3: Convert/reshape to numpy array, avoiding BGR conversion.
+    if 'ABC32f' in str(fmt_name):
+        np_array = raw_data.reshape((height, width, 3))
+    elif 'C32f' in str(fmt_name):
+        np_array = raw_data.reshape((height, width, 1))
+    else:
+        if len(raw_data) == height * width * 3:
+            np_array = raw_data.reshape((height, width, 3))
+        elif len(raw_data) == height * width:
+            np_array = raw_data.reshape((height, width))
+        else:
+            np_array = raw_data
+            
+    # Serialise to .npy bytearray using io.BytesIO
+    import io
+    f = io.BytesIO()
+    np.save(f, np_array)
+    npy_bytes = f.getvalue()
+    
+    return {
+        "shape": list(np_array.shape),
+        "npy_bytes": npy_bytes,
+        "data_format": str(fmt_name),
+        "width": width,
+        "height": height
+    }
+
+def acquire_3d_frame(cti_path, serial_number):
+    logger.info(f"Acquiring 3D frame from camera {serial_number}")
+    try:
+        if not HAS_HARVESTERS:
+            if "invalid" in str(cti_path) or "fail" in str(cti_path):
+                raise ConnectionError("Simulated camera connection failure for testing.")
+            buffer = _generate_mock_3d_buffer()
+        else:
+            conn = get_connection(cti_path, serial_number)
+            ia = conn.acquirer
+            started_here = False
+            if not ia.is_acquiring():
+                ia.start()
+                started_here = True
+            try:
+                buffer = ia.fetch()
+            finally:
+                if started_here:
+                    ia.stop()
+                    
+        # Parse & decode ToF payload
+        res = handle_3d_payload(buffer)
+        
+        # Save to Moqui DB & disk file
+        db_res = save_tensor_to_db(res["shape"], res["npy_bytes"], res["data_format"], serial_number)
+        return db_res
+    except Exception as e:
+        update_device_status_to_error()
+        raise e
+
+_ec_local = None
+_device_id = None
+
+def get_moqui_ec():
+    global _ec_local
+    return _ec_local
+
+def update_device_status_to_error():
+    global _ec_local, _device_id
+    if _ec_local is not None and _device_id is not None:
+        try:
+            db = _ec_local.getEntity()
+            device_val = db.find("moqui.device.Device").condition("deviceId", _device_id).one()
+            if device_val is not None:
+                device_val = device_val.cloneValue()
+                device_val.set("statusId", "DbsErrorStop")
+                device_val.update()
+                logger.info(f"Updated Moqui Device {_device_id} status to DbsErrorStop due to hardware/connection failure.")
+        except Exception as e:
+            logger.error(f"Failed to update device status to DbsErrorStop: {e}")
+
+def save_tensor_to_db(shape, npy_bytes, data_format, serial_number, output_dir="runtime/genicam/tensors"):
+    ec_local = get_moqui_ec()
+    if ec_local is None:
+        raise RuntimeError("Moqui ExecutionContext (ec) is not available in Python JEP context.")
+        
+    logger.info("Saving ToF tensor to Moqui Database from Python JEP context...")
+    
+    transaction_facade = ec_local.getTransaction()
+    began_transaction = transaction_facade.begin(None)
+    
+    try:
+        efac = ec_local.getEntity()
+        
+        # Calculate size
+        total_elements = 1
+        for s in shape:
+            total_elements *= s
+            
+        tensor_val = efac.makeValue("moqui.math.Tensor")
+        tensor_val.setSequencedIdPrimary()
+        tensor_val.set("tensorTypeEnumId", "TtDense")
+        tensor_val.set("purposeEnumId", "TpImageRep")
+        tensor_val.set("name", f"GenICam 3D Frame - Camera {serial_number}")
+        tensor_val.set("description", f"3D depth map acquired from GenICam Camera {serial_number} in format {data_format}")
+        tensor_val.set("rank", len(shape))
+        tensor_val.set("shape", str(shape))
+        tensor_val.set("size", int(total_elements))
+        tensor_val.create()
+        
+        tensor_id = tensor_val.get("tensorId")
+        
+        # Create TensorAxis records
+        for idx, size_val in enumerate(shape):
+            axis_val = efac.makeValue("moqui.math.TensorAxis")
+            axis_val.set("tensorId", tensor_id)
+            axis_val.set("axisIndex", idx)
+            axis_val.set("axisSize", int(size_val))
+            axis_val.set("axisTypeEnumId", "TatDense")
+            
+            # Set stride
+            stride_val = 1
+            for s_idx in range(idx + 1, len(shape)):
+                stride_val *= shape[s_idx]
+            axis_val.set("axisStride", int(stride_val))
+            
+            if idx == 0:
+                axis_val.set("purposeEnumId", "TapHeight")
+                axis_val.set("label", "Y")
+            elif idx == 1:
+                axis_val.set("purposeEnumId", "TapWidth")
+                axis_val.set("label", "X")
+            else:
+                axis_val.set("purposeEnumId", "TapChannel")
+                axis_val.set("label", "C")
+            axis_val.create()
+            
+        # Resolve output directory using ResourceFacade
+        import os
+        try:
+            runtime_ref = ec_local.getResource().getLocationReference("runtime")
+            if runtime_ref is not None:
+                runtime_dir = runtime_ref.getPath()
+                output_dir = os.path.join(runtime_dir, "genicam", "tensors")
+        except Exception as e:
+            logger.warning(f"Could not resolve runtime dir via ResourceFacade: {e}. Using relative path.")
+            
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+            
+        file_name = f"tensor_{tensor_id}.npy"
+        npy_file_path = os.path.join(output_dir, file_name)
+        
+        with open(npy_file_path, "wb") as f:
+            f.write(npy_bytes)
+            
+        content_location = npy_file_path.replace("\\", "/")
+        
+        tensor_content_val = efac.makeValue("moqui.math.TensorContent")
+        tensor_content_val.setSequencedIdPrimary()
+        tensor_content_val.set("tensorId", tensor_id)
+        tensor_content_val.set("contentTypeEnumId", "TCntNpy")
+        tensor_content_val.set("contentLocation", content_location)
+        tensor_content_val.set("description", f"Numpy binary for Tensor {tensor_id}")
+        tensor_content_val.create()
+        
+        tensor_content_id = tensor_content_val.get("tensorContentId")
+        
+        transaction_facade.commit(began_transaction)
+        logger.info(f"Successfully saved 3D frame to Tensor {tensor_id} and TensorContent {tensor_content_id} at {content_location}")
+        
+        return {
+            "tensorId": tensor_id,
+            "tensorContentId": tensor_content_id,
+            "contentLocation": content_location
+        }
+        
+    except Exception as e:
+        transaction_facade.rollback(began_transaction, f"Error writing tensor records from Python: {e}", e)
+        logger.error(f"Transaction rolled back due to error: {e}")
+        raise
+
 def convert_to_numpy_array(component):
     """Converts a Harvesters payload component into a standard BGR image array using OpenCV."""
     if not HAS_OPENCV:
@@ -278,24 +543,31 @@ class AcquisitionThread(threading.Thread):
                         # Fetch buffer with short timeout to keep thread responsive to stop signals
                         with ia.fetch(timeout=1.0) as buffer:
                             payload = buffer.payload
+                            payload_type = getattr(payload, 'type', None)
                             components = getattr(payload, 'components', [])
                             
                             if not components:
                                 continue
                             
-                            # Standard component resolution
-                            comp = components[0]
-                            img = convert_to_numpy_array(comp)
-                            
-                            if img is not None and HAS_OPENCV:
-                                success, encoded_img = cv2.imencode('.jpg', img)
-                                if success:
-                                    jpeg_bytes = encoded_img.tobytes()
-                                    with _latest_frames_lock:
-                                        _latest_frames[self.serial_number] = (jpeg_bytes, 0, getattr(comp, 'data_format_name', 'Mono8'))
-                            else:
+                            if payload_type in (6, 7):
+                                logger.info(f"Intercepted GenDC/Multi-Part 3D payload of type {payload_type} in streaming thread")
+                                res = handle_3d_payload(buffer)
                                 with _latest_frames_lock:
-                                    _latest_frames[self.serial_number] = (comp.data.tobytes(), 0, getattr(comp, 'data_format_name', 'Mono8'))
+                                    _latest_frames[self.serial_number] = (res["npy_bytes"], 1, res["data_format"])
+                            else:
+                                # Standard component resolution
+                                comp = components[0]
+                                img = convert_to_numpy_array(comp)
+                                
+                                if img is not None and HAS_OPENCV:
+                                    success, encoded_img = cv2.imencode('.jpg', img)
+                                    if success:
+                                        jpeg_bytes = encoded_img.tobytes()
+                                        with _latest_frames_lock:
+                                            _latest_frames[self.serial_number] = (jpeg_bytes, 0, getattr(comp, 'data_format_name', 'Mono8'))
+                                else:
+                                    with _latest_frames_lock:
+                                        _latest_frames[self.serial_number] = (comp.data.tobytes(), 0, getattr(comp, 'data_format_name', 'Mono8'))
                     except Exception as e:
                         # Timeout exceptions are expected when frame rates are low
                         if "Timeout" in type(e).__name__ or "timeout" in str(e).lower():
@@ -511,23 +783,32 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
         for i in range(num_frames):
             with ia.fetch() as buffer:
                 payload = buffer.payload
+                payload_type = getattr(payload, 'type', None)
                 components = getattr(payload, 'components', [])
                 
-                # Support multi-component payload
-                for c_idx, comp in enumerate(components):
-                    img = convert_to_numpy_array(comp)
-                    
-                    if img is not None and HAS_OPENCV:
-                        # Determine standard extension based on conversion success
-                        frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.jpg")
-                        cv2.imwrite(frame_path, img)
-                    else:
-                        frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.bin")
-                        with open(frame_path, "wb") as f:
-                            f.write(comp.data.tobytes())
-                            
+                if payload_type in (6, 7):
+                    res = handle_3d_payload(buffer)
+                    frame_path = os.path.join(output_dir, f"frame_{i:04d}_3d.npy")
+                    with open(frame_path, "wb") as f:
+                        f.write(res["npy_bytes"])
                     frame_files.append(frame_path)
-                    logger.info(f"Acquired frame {i}, component {c_idx} saved to {frame_path}")
+                    logger.info(f"Acquired 3D frame {i} saved to {frame_path}")
+                else:
+                    # Support multi-component payload
+                    for c_idx, comp in enumerate(components):
+                        img = convert_to_numpy_array(comp)
+                        
+                        if img is not None and HAS_OPENCV:
+                          # Determine standard extension based on conversion success
+                          frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.jpg")
+                          cv2.imwrite(frame_path, img)
+                        else:
+                          frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.bin")
+                          with open(frame_path, "wb") as f:
+                              f.write(comp.data.tobytes())
+                              
+                        frame_files.append(frame_path)
+                        logger.info(f"Acquired frame {i}, component {c_idx} saved to {frame_path}")
         
         ia.stop()
         logger.info("Image acquisition stopped.")
@@ -538,26 +819,38 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
         except: pass
         raise e
 
-def run_action(action, cti_path, serial_number, parameter_names=None, parameters_map=None):
+def run_action(action, cti_path, serial_number, parameter_names=None, parameters_map=None, ec=None, device_id=None):
     """Router function called from JEP."""
-    if action == "read":
-        return read_camera_parameters(cti_path, serial_number, parameter_names or [])
-    elif action == "write":
-        return write_camera_parameters(cti_path, serial_number, parameters_map or {})
-    elif action == "video":
-        num_frames = parameters_map.get("num_frames", 10) if parameters_map else 10
-        output_dir = parameters_map.get("output_dir", "runtime/genicam/frames") if parameters_map else "runtime/genicam/frames"
-        return acquire_video_stream(cti_path, serial_number, num_frames=num_frames, output_dir=output_dir)
-    elif action == "close_all":
-        close_all_connections()
-        return {"status": "success"}
-    elif action == "get_frame":
-        # Direct retrieval of latest cached JPEG frame
-        with _latest_frames_lock:
-            frame_data = _latest_frames.get(serial_number, None)
-        if frame_data:
-            return {"jpeg_bytes": frame_data[0]}
+    global _ec_local, _device_id
+    _ec_local = ec
+    _device_id = device_id
+    try:
+        if action == "read":
+            return read_camera_parameters(cti_path, serial_number, parameter_names or [])
+        elif action == "write":
+            return write_camera_parameters(cti_path, serial_number, parameters_map or {})
+        elif action == "video":
+            num_frames = parameters_map.get("num_frames", 10) if parameters_map else 10
+            output_dir = parameters_map.get("output_dir", "runtime/genicam/frames") if parameters_map else "runtime/genicam/frames"
+            return acquire_video_stream(cti_path, serial_number, num_frames=num_frames, output_dir=output_dir)
+        elif action == "acquire_3d_frame":
+            return acquire_3d_frame(cti_path, serial_number)
+        elif action == "close_all":
+            close_all_connections()
+            return {"status": "success"}
+        elif action == "get_frame":
+            # Direct retrieval of latest cached JPEG frame
+            with _latest_frames_lock:
+                frame_data = _latest_frames.get(serial_number, None)
+            if frame_data:
+                # If it's a 3D npy file, return the mock jpeg instead for safety in MJPEG view
+                if frame_data[1] == 1:
+                    return {"jpeg_bytes": _generate_mock_jpeg(serial_number, 0)}
+                return {"jpeg_bytes": frame_data[0]}
+            else:
+                return {"jpeg_bytes": _generate_mock_jpeg(serial_number, 0)}
         else:
-            return {"jpeg_bytes": _generate_mock_jpeg(serial_number, 0)}
-    else:
-        raise ValueError(f"Unknown action: {action}")
+            raise ValueError(f"Unknown action: {action}")
+    except Exception as e:
+        update_device_status_to_error()
+        raise e

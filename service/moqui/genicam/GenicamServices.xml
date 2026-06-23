@@ -126,7 +126,7 @@ along with this software (see the LICENSE.md file). If not, see
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
-            <parameter name="numFrames" type="Integer" default="10"/>
+            <parameter name="numFrames" type="Integer"/>
             <parameter name="outputDir"/>
             <parameter name="imageFormat"/>
             <parameter name="resizeWidth" type="Integer"/>
@@ -175,12 +175,13 @@ along with this software (see the LICENSE.md file). If not, see
                 String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
                         "genicam.frames.path", GenicamUtil.DEFAULT_FRAMES_PATH)
                 String resolvedImageFormat = GenicamUtil.resolveImageFormat(ec, imageFormat)
+                Integer resolvedNumFrames = GenicamUtil.resolveConfiguredInteger(ec, numFrames, "genicam.frames.default.numFrames")
                 Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.frames.resize.width")
                 Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.frames.resize.height")
                 Map<String, Object> pyResults = [:]
 
                 try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
-                    pyResults = client.acquireVideoStream(numFrames, resolvedOutputDir, resolvedImageFormat,
+                    pyResults = client.acquireVideoStream(resolvedNumFrames, resolvedOutputDir, resolvedImageFormat,
                             resolvedResizeWidth, resolvedResizeHeight)
                 } catch (Throwable t) {
                     ec.logger.error("GenICam JEP video stream acquisition failed", t)
@@ -196,8 +197,8 @@ along with this software (see the LICENSE.md file). If not, see
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
-            <parameter name="numFrames" type="Integer" default="60"/>
-            <parameter name="fps" type="BigDecimal" default="15.0"/>
+            <parameter name="numFrames" type="Integer"/>
+            <parameter name="fps" type="BigDecimal"/>
             <parameter name="outputDir"/>
             <parameter name="videoContainer"/>
             <parameter name="videoCodec"/>
@@ -252,12 +253,14 @@ along with this software (see the LICENSE.md file). If not, see
                         "genicam.videos.path", GenicamUtil.DEFAULT_VIDEOS_PATH)
                 String resolvedVideoContainer = GenicamUtil.resolveVideoContainer(ec, videoContainer)
                 String resolvedVideoCodec = GenicamUtil.resolveVideoCodec(ec, videoCodec)
+                Integer resolvedNumFrames = GenicamUtil.resolveConfiguredInteger(ec, numFrames, "genicam.videos.default.numFrames")
+                BigDecimal resolvedFps = GenicamUtil.resolveConfiguredBigDecimal(ec, fps, "genicam.videos.default.fps")
                 Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.videos.resize.width")
                 Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.videos.resize.height")
                 Map<String, Object> pyResults = [:]
 
                 try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
-                    pyResults = client.acquireVideoFile(numFrames, fps, resolvedOutputDir,
+                    pyResults = client.acquireVideoFile(resolvedNumFrames, resolvedFps, resolvedOutputDir,
                             resolvedVideoContainer, resolvedVideoCodec, resolvedResizeWidth, resolvedResizeHeight)
                 } catch (Throwable t) {
                     ec.logger.error("GenICam JEP video file acquisition failed", t)
@@ -277,8 +280,8 @@ along with this software (see the LICENSE.md file). If not, see
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
-            <parameter name="useCachedFrame" type="Boolean" default="true"/>
-            <parameter name="saveSnapshot" type="Boolean" default="false"/>
+            <parameter name="useCachedFrame" type="Boolean"/>
+            <parameter name="saveSnapshot" type="Boolean"/>
             <parameter name="outputDir"/>
             <parameter name="imageFormat"/>
             <parameter name="resizeWidth" type="Integer"/>
@@ -338,13 +341,17 @@ along with this software (see the LICENSE.md file). If not, see
                 String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
                         "genicam.servo.path", GenicamUtil.DEFAULT_SERVO_PATH)
                 String resolvedImageFormat = GenicamUtil.resolveImageFormat(ec, imageFormat)
+                Boolean resolvedUseCachedFrame = GenicamUtil.resolveConfiguredBoolean(ec, useCachedFrame,
+                        "genicam.servo.default.useCachedFrame")
+                Boolean resolvedSaveSnapshot = GenicamUtil.resolveConfiguredBoolean(ec, saveSnapshot,
+                        "genicam.servo.default.saveSnapshot")
                 Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.servo.resize.width")
                 Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.servo.resize.height")
                 Map<String, Object> pyResults = [:]
 
                 try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
-                    pyResults = client.acquireVisualServoFrame(useCachedFrame as boolean,
-                            saveSnapshot as boolean, resolvedOutputDir, resolvedImageFormat,
+                    pyResults = client.acquireVisualServoFrame(resolvedUseCachedFrame as boolean,
+                            resolvedSaveSnapshot as boolean, resolvedOutputDir, resolvedImageFormat,
                             resolvedResizeWidth, resolvedResizeHeight)
                 } catch (Throwable t) {
                     ec.logger.error("GenICam JEP visual servo frame acquisition failed", t)
@@ -371,6 +378,8 @@ along with this software (see the LICENSE.md file). If not, see
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
+            <parameter name="maxFrames" type="Integer"/>
+            <parameter name="frameDelayMs" type="Long"/>
         </in-parameters>
         <actions>
             <if condition="!ec.web">
@@ -409,6 +418,8 @@ along with this software (see the LICENSE.md file). If not, see
 
                 ExecutionContext ec = context.ec
                 String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                Integer resolvedMaxFrames = GenicamUtil.resolveConfiguredInteger(ec, maxFrames, "genicam.stream.max.frames")
+                Long resolvedFrameDelayMs = GenicamUtil.resolveConfiguredLong(ec, frameDelayMs, "genicam.stream.frame.delay.ms")
 
                 HttpServletResponse response = (HttpServletResponse) ec.web.response
                 response.setContentType("multipart/x-mixed-replace; boundary=frame")
@@ -419,11 +430,9 @@ along with this software (see the LICENSE.md file). If not, see
                 OutputStream os = response.getOutputStream()
 
                 try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
-                    // stream 100 frames (~7 seconds) as a safety-net limit for testing, or until client disconnects
-                    int maxFrames = 100
                     int frameCount = 0
                     
-                    while (frameCount < maxFrames) {
+                    while (frameCount < resolvedMaxFrames) {
                         byte[] jpegBytes = client.getFrameBytes()
 
                         if (jpegBytes) {
@@ -438,7 +447,7 @@ along with this software (see the LICENSE.md file). If not, see
                             }
                         }
                         frameCount++
-                        Thread.sleep(66) // ~15 FPS
+                        Thread.sleep(resolvedFrameDelayMs)
                     }
                 } catch (Throwable t) {
                     ec.logger.error("GenICam Live MJPEG stream error", t)

@@ -14,6 +14,7 @@
 package org.moqui.genicam
 
 import java.io.File
+import java.math.BigDecimal
 import org.moqui.context.ExecutionContext
 import org.moqui.entity.EntityValue
 
@@ -173,6 +174,41 @@ final class GenicamUtil {
         String configuredValue = resolveConfigProperty(ec, propertyName, null)
         if (!configuredValue) return null
         return Integer.parseInt(configuredValue)
+    }
+
+    static Long resolveConfiguredLong(final ExecutionContext ec, final Object value, final String propertyName) {
+        if (value != null && value.toString()) return Long.parseLong(value.toString())
+        String configuredValue = resolveConfigProperty(ec, propertyName, null)
+        if (!configuredValue) return null
+        return Long.parseLong(configuredValue)
+    }
+
+    static BigDecimal resolveConfiguredBigDecimal(final ExecutionContext ec, final Object value, final String propertyName) {
+        if (value != null && value.toString()) return new BigDecimal(value.toString())
+        String configuredValue = resolveConfigProperty(ec, propertyName, null)
+        if (!configuredValue) return null
+        return new BigDecimal(configuredValue)
+    }
+
+    static Boolean resolveConfiguredBoolean(final ExecutionContext ec, final Object value, final String propertyName) {
+        if (value != null && value.toString()) return Boolean.valueOf(value.toString())
+        String configuredValue = resolveConfigProperty(ec, propertyName, null)
+        if (!configuredValue) return null
+        return Boolean.valueOf(configuredValue)
+    }
+
+    static Map<String, Object> buildPythonRuntimeConfig(final ExecutionContext ec) {
+        Map<String, Object> runtimeConfig = [:]
+
+        runtimeConfig.connect_retry_count = resolveConfiguredInteger(ec, null, "genicam.connection.retry.count")
+        runtimeConfig.connect_retry_backoff_ms = resolveConfiguredLong(ec, null, "genicam.connection.retry.backoff.ms")
+        runtimeConfig.fetch_timeout_ms = resolveConfiguredLong(ec, null, "genicam.connection.fetch.timeout.ms")
+        runtimeConfig.stream_stop_timeout_ms = resolveConfiguredLong(ec, null, "genicam.stream.stop.timeout.ms")
+        runtimeConfig.stream_mock_frame_delay_ms = resolveConfiguredLong(ec, null, "genicam.stream.mock.frame.delay.ms")
+        runtimeConfig.servo_buffer_source = resolveConfigProperty(ec, "genicam.servo.buffer.source", "latest")
+        runtimeConfig.servo_max_frame_age_ms = resolveConfiguredLong(ec, null, "genicam.servo.max.frame.age.ms")
+
+        return runtimeConfig.findAll { String key, Object entryValue -> entryValue != null }
     }
 
     static Map<String, Object> storeTensorPayload(final ExecutionContext ec, final String serialNumber,

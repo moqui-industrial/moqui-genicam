@@ -131,10 +131,13 @@ class GenicamClient implements Closeable, AutoCloseable {
 
     private void initInterpreter() {
         String scriptDir = resolveScriptDir()
+        Map<String, Object> runtimeConfig = GenicamUtil.buildPythonRuntimeConfig(ec)
         interpreter.exec("import sys")
         interpreter.set("script_dir", scriptDir)
         interpreter.exec("if script_dir not in sys.path: sys.path.append(script_dir)")
         interpreter.exec("import genicam_bridge")
+        interpreter.set("runtime_config", runtimeConfig)
+        interpreter.exec("genicam_bridge.configure_runtime(runtime_config)")
     }
 
     private String resolveScriptDir() {

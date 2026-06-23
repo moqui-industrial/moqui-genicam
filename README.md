@@ -2,6 +2,8 @@
 
 `moqui-genicam` is a **model-first** and **data-driven** integration component for the Moqui Framework. It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via **JEP** (Java Embedded Python) and the Python **Harvesters** library.
 
+JEP embeds Python inside the JVM process. It does **not** spawn a separate operating-system Python process for every script call; each Moqui service call creates or uses a JEP interpreter inside the Java process, and the Python code runs there unless you explicitly orchestrate external processes.
+
 ---
 
 ## 🌟 Why `moqui-genicam` is Unique
@@ -143,4 +145,76 @@ genicam.tensors.path
 genicam.image.format        # jpg, png, bmp
 genicam.video.container     # avi, mp4
 genicam.video.codec         # MJPG, XVID, mp4v
+genicam.frames.default.numFrames
+genicam.videos.default.numFrames
+genicam.videos.default.fps
+genicam.connection.retry.count
+genicam.connection.retry.backoff.ms
+genicam.connection.fetch.timeout.ms
+genicam.stream.max.frames
+genicam.stream.frame.delay.ms
+genicam.stream.stop.timeout.ms
+genicam.stream.mock.frame.delay.ms
+genicam.servo.default.useCachedFrame
+genicam.servo.default.saveSnapshot
+genicam.servo.buffer.source
+genicam.servo.max.frame.age.ms
+```
+
+## Ubuntu And Container Notes
+
+For Ubuntu deployments, prefer running one camera-facing Moqui container per physical camera or per small camera group. This avoids GenTL/Harvesters contention inside a single process and matches the most reliable real-hardware tests.
+
+Operational recommendations:
+
+```text
+1. Install the vendor GenTL/SDK package inside the image or mount it read-only.
+2. Expose the CTI path through DeviceConnection.transportConfig.
+3. Install Python dependencies from requirements.txt in the same container used by Moqui/JEP.
+4. Persist runtime/genicam/images, frames, videos, servo, and tensors on mounted volumes.
+5. Keep one stable network interface and MTU profile per GigE camera group.
+6. Use AVI/MJPG as the safest default for operator playback compatibility.
+```
+
+Example container concerns:
+
+```text
+- mount CTI/SDK files: /opt/vendor/cti
+- mount output volumes: /opt/moqui/runtime/genicam/*
+- set timezone and locale explicitly
+- keep container CPU pinned when low-latency servo loops matter
+- if multiple cameras are needed, prefer multiple containers over many in-process threads
+```
+
+## Visual Servoing Pattern
+
+Recommended loop:
+
+```text
+1. Start streaming/caching for the camera.
+2. Pull the latest cached frame with acquire#VisualServoFrame(useCachedFrame=true).
+3. Reject frames older than the configured latency budget.
+4. Run vision inference on the cached frame only.
+5. Send robot/PLC correction.
+6. Repeat at a fixed cycle time.
+```
+
+Practical buffering pattern:
+
+```text
+- buffer strategy: latest-wins
+- producer: background acquisition thread updates the latest frame cache
+- consumer: servo loop reads one frame snapshot without queue buildup
+- latency control: cap camera fetch timeout and consumer cycle time
+- fallback: if cache is stale, reacquire with useCachedFrame=false
+```
+
+Suggested latency policy:
+
+```text
+- servo buffer source: latest
+- servo max frame age: 100-250 ms
+- stream frame delay: tuned to the control-loop budget
+- do not let image queues grow unbounded
+- prefer dropping old frames rather than processing stale ones
 ```

@@ -89,6 +89,13 @@ _streaming_threads_lock = threading.Lock()
 SUPPORTED_IMAGE_FORMATS = {"jpg", "png", "bmp"}
 SUPPORTED_VIDEO_CONTAINERS = {"avi", "mp4"}
 SUPPORTED_VIDEO_CODECS = {"MJPG", "XVID", "mp4v"}
+DEFAULT_CONNECT_RETRY_COUNT = 3
+DEFAULT_CONNECT_RETRY_BACKOFF_MS = 1000
+DEFAULT_FETCH_TIMEOUT_MS = 1000
+DEFAULT_STREAM_STOP_TIMEOUT_MS = 3000
+DEFAULT_STREAM_MOCK_FRAME_DELAY_MS = 100
+DEFAULT_SERVO_BUFFER_SOURCE = "latest"
+DEFAULT_SERVO_MAX_FRAME_AGE_MS = 250
 
 def _map_get(java_map, key, default=None):
     if java_map is None:
@@ -110,6 +117,41 @@ def _bool_value(value, default=False):
     if isinstance(value, str):
         return value.strip().lower() in ("y", "yes", "true", "1", "on")
     return bool(value)
+
+
+def _int_value(value, default):
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def configure_runtime(settings):
+    global DEFAULT_CONNECT_RETRY_COUNT, DEFAULT_CONNECT_RETRY_BACKOFF_MS
+    global DEFAULT_FETCH_TIMEOUT_MS, DEFAULT_STREAM_STOP_TIMEOUT_MS
+    global DEFAULT_STREAM_MOCK_FRAME_DELAY_MS
+    global DEFAULT_SERVO_BUFFER_SOURCE, DEFAULT_SERVO_MAX_FRAME_AGE_MS
+
+    if settings is None:
+        return
+
+    DEFAULT_CONNECT_RETRY_COUNT = _int_value(_map_get(settings, "connect_retry_count", DEFAULT_CONNECT_RETRY_COUNT),
+        DEFAULT_CONNECT_RETRY_COUNT)
+    DEFAULT_CONNECT_RETRY_BACKOFF_MS = _int_value(
+        _map_get(settings, "connect_retry_backoff_ms", DEFAULT_CONNECT_RETRY_BACKOFF_MS),
+        DEFAULT_CONNECT_RETRY_BACKOFF_MS)
+    DEFAULT_FETCH_TIMEOUT_MS = _int_value(_map_get(settings, "fetch_timeout_ms", DEFAULT_FETCH_TIMEOUT_MS),
+        DEFAULT_FETCH_TIMEOUT_MS)
+    DEFAULT_STREAM_STOP_TIMEOUT_MS = _int_value(
+        _map_get(settings, "stream_stop_timeout_ms", DEFAULT_STREAM_STOP_TIMEOUT_MS),
+        DEFAULT_STREAM_STOP_TIMEOUT_MS)
+    DEFAULT_STREAM_MOCK_FRAME_DELAY_MS = _int_value(
+        _map_get(settings, "stream_mock_frame_delay_ms", DEFAULT_STREAM_MOCK_FRAME_DELAY_MS),
+        DEFAULT_STREAM_MOCK_FRAME_DELAY_MS)
+    DEFAULT_SERVO_BUFFER_SOURCE = str(_map_get(settings, "servo_buffer_source", DEFAULT_SERVO_BUFFER_SOURCE) or
+        DEFAULT_SERVO_BUFFER_SOURCE).strip().lower()
+    DEFAULT_SERVO_MAX_FRAME_AGE_MS = _int_value(
+        _map_get(settings, "servo_max_frame_age_ms", DEFAULT_SERVO_MAX_FRAME_AGE_MS),
+        DEFAULT_SERVO_MAX_FRAME_AGE_MS)
 
 
 def _normalize_image_format(image_format, default="jpg"):
@@ -267,9 +309,9 @@ class CameraConnection:
         logger.info(f"Opening persistent connection to camera {self.serial_number} using driver {self.cti_path}")
         
         retry_count = 0
-        backoff = 1.0
+        backoff = max(DEFAULT_CONNECT_RETRY_BACKOFF_MS, 1) / 1000.0
         
-        while retry_count < 3:
+        while retry_count < DEFAULT_CONNECT_RETRY_COUNT:
             try:
                 self.harvester = Harvester()
                 self.harvester.add_file(self.cti_path)
@@ -281,13 +323,13 @@ class CameraConnection:
                 return
             except Exception as e:
                 retry_count += 1
-                logger.warning(f"Connection attempt {retry_count}/3 failed for {self.serial_number}: {e}")
+                logger.warning(f"Connection attempt {retry_count}/{DEFAULT_CONNECT_RETRY_COUNT} failed for {self.serial_number}: {e}")
                 self.disconnect()
-                if retry_count < 3:
+                if retry_count < DEFAULT_CONNECT_RETRY_COUNT:
                     time.sleep(backoff)
                     backoff *= 2.0
         
-        raise ConnectionError(f"Failed to connect to camera {self.serial_number} after 3 attempts.")
+        raise ConnectionError(f"Failed to connect to camera {self.serial_number} after {DEFAULT_CONNECT_RETRY_COUNT} attempts.")
 
     def disconnect(self):
         logger.info(f"Closing connection to camera {self.serial_number}")
@@ -503,7 +545,7 @@ def acquire_3d_frame(cti_path, serial_number):
             ia.start()
             started_here = True
         try:
-            buffer = ia.fetch()
+            buffer = ia.fetch(timeout=max(DEFAULT_FETCH_TIMEOUT_MS, 1) / 1000.0)
         finally:
             if started_here:
                 ia.stop()
@@ -630,6 +672,16 @@ def _normalize_frame_entry(serial_number, frame_data):
             extension="jpg", jpeg_bytes=frame_data[0], source="cache")
 
     raise ValueError(f"Unsupported frame cache entry type for camera {serial_number}: {type(frame_data)}")
+
+
+def _is_frame_entry_stale(frame_entry, max_frame_age_ms):
+    if not frame_entry or max_frame_age_ms is None or max_frame_age_ms <= 0:
+        return False
+    captured_at = frame_entry.get("captured_at")
+    if captured_at is None:
+        return True
+    frame_age_ms = (time.time() - float(captured_at)) * 1000.0
+    return frame_age_ms > max_frame_age_ms
 
 def _write_frame_entry_files(serial_number, frame_entry, output_dir, prefix):
     _ensure_output_dir(output_dir)
@@ -797,10 +849,13 @@ def acquire_visual_servo_frame(cti_path, serial_number, use_cached=True, save_sn
     logger.info(f"Acquiring visual servo frame from camera {serial_number} (use_cached={use_cached}, save_snapshot={save_snapshot})")
 
     frame_entry = None
-    if use_cached:
+    if use_cached and DEFAULT_SERVO_BUFFER_SOURCE == "latest":
         with _latest_frames_lock:
             frame_entry = _latest_frames.get(serial_number, None)
         frame_entry = _normalize_frame_entry(serial_number, frame_entry) if frame_entry else None
+        if _is_frame_entry_stale(frame_entry, DEFAULT_SERVO_MAX_FRAME_AGE_MS):
+            logger.info(f"Cached frame for camera {serial_number} is stale; acquiring a fresh frame.")
+            frame_entry = None
 
     if frame_entry is None:
         frame_entry = _fetch_single_capture(cti_path, serial_number, image_format=image_format,
@@ -837,7 +892,7 @@ class AcquisitionThread(threading.Thread):
             if _is_mock(self.cti_path, self.serial_number):
                 # Mock acquisition loop
                 try:
-                    time.sleep(0.1) # Simulate 10 FPS
+                    time.sleep(max(DEFAULT_STREAM_MOCK_FRAME_DELAY_MS, 1) / 1000.0)
                     self.mock_frame_index += 1
                     jpeg_bytes = _generate_mock_jpeg(self.serial_number, self.mock_frame_index)
                     _cache_latest_frame(self.serial_number,
@@ -862,7 +917,7 @@ class AcquisitionThread(threading.Thread):
                 while self.running:
                     try:
                         # Fetch buffer with short timeout to keep thread responsive to stop signals
-                        with ia.fetch(timeout=1.0) as buffer:
+                        with ia.fetch(timeout=max(DEFAULT_FETCH_TIMEOUT_MS, 1) / 1000.0) as buffer:
                             payload = buffer.payload
                             payload_type = getattr(payload, 'type', None)
                             components = getattr(payload, 'components', [])
@@ -936,7 +991,7 @@ def _stop_stream(serial_number):
         if serial_number in _streaming_threads:
             thread = _streaming_threads[serial_number]
             thread.stop()
-            thread.join(timeout=3.0)
+            thread.join(timeout=max(DEFAULT_STREAM_STOP_TIMEOUT_MS, 1) / 1000.0)
             del _streaming_threads[serial_number]
             logger.info(f"Streaming stopped for camera {serial_number}")
 
@@ -1100,7 +1155,7 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir=DEFA
         
         frame_files = []
         for i in range(num_frames):
-            with ia.fetch() as buffer:
+            with ia.fetch(timeout=max(DEFAULT_FETCH_TIMEOUT_MS, 1) / 1000.0) as buffer:
                 payload = buffer.payload
                 payload_type = getattr(payload, 'type', None)
                 components = getattr(payload, 'components', [])

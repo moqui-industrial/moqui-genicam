@@ -29,6 +29,18 @@ along with this software (see the LICENSE.md file). If not, see
     <moqui.device.PhysicalDevice deviceId="FLIR_CAMERA_1" deviceName="FLIR BFS PGE 120S6C C"
         vendorName="FLIR" modelName="BFS-PGE-120S6C-C" version="1.0" hardwareVersion="BFS-PGE-120S6C-C" firmwareVersion="1.2"/>
 
+    <!-- Optional real PhysicalDevice for local FLIR camera testing -->
+    <moqui.device.Device deviceId="FLIR_CAMERA_REAL_19176722" parentDeviceId="FLIR_BFS_PGE_120S6C_C"
+        deviceTypeEnumId="DtVisionCamera" statusFlowId="DeviceBasicStatusFlow" statusId="DbsStandstill"
+        serialNumber="19176722" description="Connected FLIR Camera Instance - Real serial 19176722"/>
+    <moqui.device.PhysicalDevice deviceId="FLIR_CAMERA_REAL_19176722" deviceName="FLIR BFS PGE 120S6C C"
+        vendorName="FLIR" modelName="BFS-PGE-200S6C" version="1.0" hardwareVersion="BFS-PGE-200S6C" firmwareVersion="2103.0.330.0"/>
+    <moqui.device.Device deviceId="FLIR_CAMERA_REAL_25040613" parentDeviceId="FLIR_BFS_PGE_120S6C_C"
+        deviceTypeEnumId="DtVisionCamera" statusFlowId="DeviceBasicStatusFlow" statusId="DbsStandstill"
+        serialNumber="25040613" description="Connected FLIR Camera Instance - Real serial 25040613"/>
+    <moqui.device.PhysicalDevice deviceId="FLIR_CAMERA_REAL_25040613" deviceName="FLIR BFS PGE 23S3C"
+        vendorName="FLIR" modelName="BFS-PGE-23S3C" version="1.0" hardwareVersion="BFS-PGE-23S3C"/>
+
     <!-- GenICam Parameter Definitions for FLIR Camera Model -->
     <moqui.math.ParameterDef parameterDefId="FLIR_BFS_ExposureTime"
         parameterCode="ExposureTime" parameterName="ExposureTime" parameterTypeEnumId="PtNumberFloat"
@@ -90,6 +102,12 @@ along with this software (see the LICENSE.md file). If not, see
     <moqui.device.DeviceConnection connectionName="FlirCameraConnection" deviceId="FLIR_CAMERA_1"
         driverEnumId="DcdGenicam" transportConfig="runtime/genicam/drivers/flir.cti"
         options="serial=FLIR_CAMERA_1"/>
+    <moqui.device.DeviceConnection connectionName="FlirCameraConnectionReal" deviceId="FLIR_CAMERA_REAL_19176722"
+        driverEnumId="DcdGenicam" transportConfig="C:/Program Files/Teledyne/Spinnaker/cti64/vs2015/Spinnaker_GenTL_v140.cti"
+        options="serial=19176722"/>
+    <moqui.device.DeviceConnection connectionName="FlirCameraConnectionReal25040613" deviceId="FLIR_CAMERA_REAL_25040613"
+        driverEnumId="DcdGenicam" transportConfig="C:/Program Files/Teledyne/Spinnaker/cti64/vs2015/Spinnaker_GenTL_v140.cti"
+        options="serial=25040613"/>
 
     <!-- Device Requests and Items for Camera Interaction -->
     <!-- 1. Write Request (Trigger Software Shot) -->

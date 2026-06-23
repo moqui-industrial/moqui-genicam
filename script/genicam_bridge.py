@@ -54,8 +54,15 @@ except ImportError:
     HAS_HARVESTERS = False
     logger.warning("Harvesters library not found. Falling back to Mock Camera Simulation.")
 
+# Default paths for standalone usage
+DEFAULT_GENICAM_DIR = os.path.join("runtime", "genicam")
+DEFAULT_IMAGES_DIR = os.path.join(DEFAULT_GENICAM_DIR, "images")
+DEFAULT_FRAMES_DIR = os.path.join(DEFAULT_GENICAM_DIR, "frames")
+DEFAULT_VIDEOS_DIR = os.path.join(DEFAULT_GENICAM_DIR, "videos")
+DEFAULT_SERVO_DIR = os.path.join(DEFAULT_GENICAM_DIR, "servo")
+
 # Path for Mock Camera State
-MOCK_STATE_DIR = "runtime/genicam"
+MOCK_STATE_DIR = DEFAULT_GENICAM_DIR
 MOCK_STATE_FILE = os.path.join(MOCK_STATE_DIR, "mock_camera_state.json")
 
 DEFAULT_MOCK_STATE = {
@@ -71,12 +78,171 @@ DEFAULT_MOCK_STATE = {
 
 # Global dictionary to cache active CameraConnection objects (keyed by (cti_path, serial_number))
 _connections_cache = {}
+_connections_lock = threading.Lock()
 
 # Thread-safe global cache for streaming
 _latest_frames = {} # serial_number -> (jpeg_bytes, component_index, data_format)
 _latest_frames_lock = threading.Lock()
 _streaming_threads = {} # serial_number -> AcquisitionThread
 _streaming_threads_lock = threading.Lock()
+
+SUPPORTED_IMAGE_FORMATS = {"jpg", "png", "bmp"}
+SUPPORTED_VIDEO_CONTAINERS = {"avi", "mp4"}
+SUPPORTED_VIDEO_CODECS = {"MJPG", "XVID", "mp4v"}
+
+def _map_get(java_map, key, default=None):
+    if java_map is None:
+        return default
+    if hasattr(java_map, "containsKey") and java_map.containsKey(key):
+        value = java_map.get(key)
+        return default if value is None else value
+    try:
+        value = java_map.get(key)
+        return default if value is None else value
+    except Exception:
+        return default
+
+def _bool_value(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("y", "yes", "true", "1", "on")
+    return bool(value)
+
+
+def _normalize_image_format(image_format, default="jpg"):
+    normalized = (image_format or default or "jpg").strip().lower()
+    if normalized == "jpeg":
+        normalized = "jpg"
+    if normalized not in SUPPORTED_IMAGE_FORMATS:
+        raise ValueError(f"Unsupported image format {image_format}. Supported formats: {sorted(SUPPORTED_IMAGE_FORMATS)}")
+    return normalized
+
+
+def _normalize_video_container(video_container, default="avi"):
+    normalized = (video_container or default or "avi").strip().lower()
+    if normalized not in SUPPORTED_VIDEO_CONTAINERS:
+        raise ValueError(f"Unsupported video container {video_container}. Supported containers: {sorted(SUPPORTED_VIDEO_CONTAINERS)}")
+    return normalized
+
+
+def _normalize_video_codec(video_codec, default="MJPG"):
+    normalized = (video_codec or default or "MJPG").strip()
+    if normalized not in SUPPORTED_VIDEO_CODECS:
+        raise ValueError(f"Unsupported video codec {video_codec}. Supported codecs: {sorted(SUPPORTED_VIDEO_CODECS)}")
+    return normalized
+
+
+def _image_content_type(image_format):
+    if image_format == "jpg":
+        return "image/jpeg"
+    if image_format == "png":
+        return "image/png"
+    if image_format == "bmp":
+        return "image/bmp"
+    return "application/octet-stream"
+
+
+def _encode_image_bytes(img, image_format):
+    normalized_format = _normalize_image_format(image_format)
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV (cv2) is required to encode image files.")
+
+    success, encoded_img = cv2.imencode(f".{normalized_format}", img)
+    if not success:
+        raise RuntimeError(f"Could not encode image using format {normalized_format}.")
+    return encoded_img.tobytes(), normalized_format, _image_content_type(normalized_format)
+
+
+def _frame_entry_to_image_array(frame_entry):
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV (cv2) is required to convert frame bytes.")
+
+    source_bytes = frame_entry.get("frame_bytes")
+    if not str(frame_entry.get("content_type") or "").startswith("image/"):
+        source_bytes = frame_entry.get("jpeg_bytes") or source_bytes
+
+    if not source_bytes:
+        raise RuntimeError("No image bytes available for frame conversion.")
+
+    image_array = cv2.imdecode(np.frombuffer(source_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image_array is None:
+        raise RuntimeError("Could not decode image bytes for frame conversion.")
+
+    return image_array
+
+
+def _resize_frame_entry(frame_entry, resize_width=None, resize_height=None):
+    width = _normalize_resize_dimension(resize_width)
+    height = _normalize_resize_dimension(resize_height)
+    if width is None and height is None:
+        return frame_entry
+
+    image_array = _frame_entry_to_image_array(frame_entry)
+    image_array = _resize_image_if_needed(image_array, resize_width=width, resize_height=height)
+
+    normalized_format = frame_entry.get("extension") or "jpg"
+    encoded_bytes, normalized_format, content_type = _encode_image_bytes(image_array, normalized_format)
+    jpeg_bytes = encoded_bytes if normalized_format == "jpg" else _encode_image_bytes(image_array, "jpg")[0]
+
+    return _build_frame_entry(encoded_bytes, frame_entry.get("component_index", 0),
+        frame_entry.get("data_format"), content_type, image_array.shape[1], image_array.shape[0],
+        normalized_format, jpeg_bytes=jpeg_bytes, source=frame_entry.get("source", "capture"))
+
+
+def _reencode_frame_entry(frame_entry, image_format):
+    normalized_format = _normalize_image_format(image_format)
+    current_extension = (frame_entry.get("extension") or "").lower()
+    if current_extension == "jpeg":
+        current_extension = "jpg"
+
+    if current_extension == normalized_format and frame_entry.get("content_type") == _image_content_type(normalized_format):
+        if normalized_format == "jpg" and not frame_entry.get("jpeg_bytes"):
+            frame_entry["jpeg_bytes"] = frame_entry.get("frame_bytes")
+        return frame_entry
+
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV (cv2) is required to convert image formats.")
+
+    image_array = _frame_entry_to_image_array(frame_entry)
+    encoded_bytes, normalized_format, content_type = _encode_image_bytes(image_array, normalized_format)
+    jpeg_bytes = frame_entry.get("jpeg_bytes")
+    if normalized_format == "jpg":
+        jpeg_bytes = encoded_bytes
+    elif not jpeg_bytes:
+        jpeg_bytes, _, _ = _encode_image_bytes(image_array, "jpg")
+
+    return _build_frame_entry(encoded_bytes, frame_entry.get("component_index", 0),
+        frame_entry.get("data_format"), content_type, frame_entry.get("width"), frame_entry.get("height"),
+        normalized_format, jpeg_bytes=jpeg_bytes, source=frame_entry.get("source", "capture"))
+
+
+def _normalize_resize_dimension(value):
+    if value is None or value == "":
+        return None
+    parsed_value = int(value)
+    return parsed_value if parsed_value > 0 else None
+
+
+def _resize_image_if_needed(image_array, resize_width=None, resize_height=None):
+    if image_array is None or not HAS_OPENCV:
+        return image_array
+
+    width = _normalize_resize_dimension(resize_width)
+    height = _normalize_resize_dimension(resize_height)
+    if width is None and height is None:
+        return image_array
+
+    current_height, current_width = image_array.shape[:2]
+    target_width = width if width is not None else current_width
+    target_height = height if height is not None else current_height
+
+    if target_width == current_width and target_height == current_height:
+        return image_array
+
+    return cv2.resize(image_array, (target_width, target_height))
 
 def _is_mock(cti_path, serial_number):
     if not HAS_HARVESTERS:
@@ -121,7 +287,6 @@ class CameraConnection:
                     time.sleep(backoff)
                     backoff *= 2.0
         
-        update_device_status_to_error()
         raise ConnectionError(f"Failed to connect to camera {self.serial_number} after 3 attempts.")
 
     def disconnect(self):
@@ -142,10 +307,10 @@ class CameraConnection:
 def get_connection(cti_path, serial_number):
     """Retrieves or creates a cached connection to the camera."""
     key = (cti_path, serial_number)
-    if key not in _connections_cache:
-        _connections_cache[key] = CameraConnection(cti_path, serial_number)
-    
-    conn = _connections_cache[key]
+    with _connections_lock:
+        if key not in _connections_cache:
+            _connections_cache[key] = CameraConnection(cti_path, serial_number)
+        conn = _connections_cache[key]
     if not _is_mock(cti_path, serial_number):
         conn.connect()
     return conn
@@ -161,12 +326,15 @@ def close_all_connections():
                 logger.error(f"Error stopping streaming thread for {serial}: {e}")
         _streaming_threads.clear()
 
-    for key, conn in list(_connections_cache.items()):
+    with _connections_lock:
+        connections = list(_connections_cache.items())
+        _connections_cache.clear()
+
+    for key, conn in connections:
         try:
             conn.disconnect()
         except Exception as e:
             logger.error(f"Error during pool cleanup for {key}: {e}")
-    _connections_cache.clear()
 
 def _get_mock_state():
     """Helper to read mock camera state from file."""
@@ -323,155 +491,38 @@ def handle_3d_payload(buffer):
 
 def acquire_3d_frame(cti_path, serial_number):
     logger.info(f"Acquiring 3D frame from camera {serial_number}")
-    try:
-        if _is_mock(cti_path, serial_number):
-            if "invalid" in str(cti_path) or "fail" in str(cti_path):
-                raise ConnectionError("Simulated camera connection failure for testing.")
-            buffer = _generate_mock_3d_buffer()
-        else:
-            conn = get_connection(cti_path, serial_number)
-            ia = conn.acquirer
-            started_here = False
-            if not ia.is_acquiring():
-                ia.start()
-                started_here = True
-            try:
-                buffer = ia.fetch()
-            finally:
-                if started_here:
-                    ia.stop()
-                    
-        # Parse & decode ToF payload
-        res = handle_3d_payload(buffer)
-        
-        # Save to Moqui DB & disk file
-        db_res = save_tensor_to_db(res["shape"], res["npy_bytes"], res["data_format"], serial_number)
-        return db_res
-    except Exception as e:
-        update_device_status_to_error()
-        raise e
-
-_ec_local = None
-_device_id = None
-
-def get_moqui_ec():
-    global _ec_local
-    return _ec_local
-
-def update_device_status_to_error():
-    global _ec_local, _device_id
-    if _ec_local is not None and _device_id is not None:
+    if _is_mock(cti_path, serial_number):
+        if "invalid" in str(cti_path) or "fail" in str(cti_path):
+            raise ConnectionError("Simulated camera connection failure for testing.")
+        buffer = _generate_mock_3d_buffer()
+    else:
+        conn = get_connection(cti_path, serial_number)
+        ia = conn.acquirer
+        started_here = False
+        if not ia.is_acquiring():
+            ia.start()
+            started_here = True
         try:
-            db = _ec_local.getEntity()
-            device_val = db.find("moqui.device.Device").condition("deviceId", _device_id).one()
-            if device_val is not None:
-                device_val = device_val.cloneValue()
-                device_val.set("statusId", "DbsErrorStop")
-                device_val.update()
-                logger.info(f"Updated Moqui Device {_device_id} status to DbsErrorStop due to hardware/connection failure.")
-        except Exception as e:
-            logger.error(f"Failed to update device status to DbsErrorStop: {e}")
+            buffer = ia.fetch()
+        finally:
+            if started_here:
+                ia.stop()
 
-def save_tensor_to_db(shape, npy_bytes, data_format, serial_number, output_dir="runtime/genicam/tensors"):
-    ec_local = get_moqui_ec()
-    if ec_local is None:
-        raise RuntimeError("Moqui ExecutionContext (ec) is not available in Python JEP context.")
-        
-    logger.info("Saving ToF tensor to Moqui Database from Python JEP context...")
-    
-    transaction_facade = ec_local.getTransaction()
-    began_transaction = transaction_facade.begin(None)
-    
+    return handle_3d_payload(buffer)
+
+def update_device_status_to_error(ec, device_id):
+    if ec is None or not device_id:
+        return
     try:
-        efac = ec_local.getEntity()
-        
-        # Calculate size
-        total_elements = 1
-        for s in shape:
-            total_elements *= s
-            
-        tensor_val = efac.makeValue("moqui.math.Tensor")
-        tensor_val.setSequencedIdPrimary()
-        tensor_val.set("tensorTypeEnumId", "TtDense")
-        tensor_val.set("purposeEnumId", "TpImageRep")
-        tensor_val.set("name", f"GenICam 3D Frame - Camera {serial_number}")
-        tensor_val.set("description", f"3D depth map acquired from GenICam Camera {serial_number} in format {data_format}")
-        tensor_val.set("rank", len(shape))
-        tensor_val.set("shape", str(shape))
-        tensor_val.set("size", int(total_elements))
-        tensor_val.create()
-        
-        tensor_id = tensor_val.get("tensorId")
-        
-        # Create TensorAxis records
-        for idx, size_val in enumerate(shape):
-            axis_val = efac.makeValue("moqui.math.TensorAxis")
-            axis_val.set("tensorId", tensor_id)
-            axis_val.set("axisIndex", idx)
-            axis_val.set("axisSize", int(size_val))
-            axis_val.set("axisTypeEnumId", "TatDense")
-            
-            # Set stride
-            stride_val = 1
-            for s_idx in range(idx + 1, len(shape)):
-                stride_val *= shape[s_idx]
-            axis_val.set("axisStride", int(stride_val))
-            
-            if idx == 0:
-                axis_val.set("purposeEnumId", "TapHeight")
-                axis_val.set("label", "Y")
-            elif idx == 1:
-                axis_val.set("purposeEnumId", "TapWidth")
-                axis_val.set("label", "X")
-            else:
-                axis_val.set("purposeEnumId", "TapChannel")
-                axis_val.set("label", "C")
-            axis_val.create()
-            
-        # Resolve output directory using ResourceFacade
-        import os
-        try:
-            runtime_ref = ec_local.getResource().getLocationReference("runtime")
-            if runtime_ref is not None:
-                runtime_dir = runtime_ref.getPath()
-                output_dir = os.path.join(runtime_dir, "genicam", "tensors")
-        except Exception as e:
-            logger.warning(f"Could not resolve runtime dir via ResourceFacade: {e}. Using relative path.")
-            
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-            
-        file_name = f"tensor_{tensor_id}.npy"
-        npy_file_path = os.path.join(output_dir, file_name)
-        
-        with open(npy_file_path, "wb") as f:
-            f.write(npy_bytes)
-            
-        content_location = npy_file_path.replace("\\", "/")
-        
-        tensor_content_val = efac.makeValue("moqui.math.TensorContent")
-        tensor_content_val.setSequencedIdPrimary()
-        tensor_content_val.set("tensorId", tensor_id)
-        tensor_content_val.set("contentTypeEnumId", "TCntNpy")
-        tensor_content_val.set("contentLocation", content_location)
-        tensor_content_val.set("description", f"Numpy binary for Tensor {tensor_id}")
-        tensor_content_val.create()
-        
-        tensor_content_id = tensor_content_val.get("tensorContentId")
-        
-        transaction_facade.commit(began_transaction)
-        logger.info(f"Successfully saved 3D frame to Tensor {tensor_id} and TensorContent {tensor_content_id} at {content_location}")
-        
-        return {
-            "tensorId": tensor_id,
-            "tensorContentId": tensor_content_id,
-            "contentLocation": content_location
-        }
-        
+        db = ec.getEntity()
+        device_val = db.find("moqui.device.Device").condition("deviceId", device_id).one()
+        if device_val is not None:
+            device_val = device_val.cloneValue()
+            device_val.set("statusId", "DbsErrorStop")
+            device_val.update()
+            logger.info(f"Updated Moqui Device {device_id} status to DbsErrorStop due to hardware/connection failure.")
     except Exception as e:
-        transaction_facade.rollback(began_transaction, f"Error writing tensor records from Python: {e}", e)
-        logger.error(f"Transaction rolled back due to error: {e}")
-        raise
+        logger.error(f"Failed to update device status to DbsErrorStop: {e}")
 
 def convert_to_numpy_array(component):
     """Converts a Harvesters payload component into a standard BGR image array using OpenCV."""
@@ -520,6 +571,252 @@ def convert_to_numpy_array(component):
         logger.error(f"Error during pixel format conversion: {e}")
         return None
 
+def _ensure_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+def _default_extension(content_type, data_format):
+    if content_type == "image/jpeg":
+        return "jpg"
+    if data_format and "Coord3D" in str(data_format):
+        return "npy"
+    return "bin"
+
+def _build_frame_entry(frame_bytes, component_index, data_format, content_type, width=None, height=None,
+        extension=None, jpeg_bytes=None, source="capture"):
+    if extension is None:
+        extension = _default_extension(content_type, data_format)
+    if jpeg_bytes is None and content_type == "image/jpeg":
+        jpeg_bytes = frame_bytes
+    return {
+        "frame_bytes": frame_bytes,
+        "jpeg_bytes": jpeg_bytes,
+        "component_index": component_index,
+        "data_format": data_format,
+        "content_type": content_type,
+        "width": width,
+        "height": height,
+        "extension": extension,
+        "captured_at": time.time(),
+        "source": source
+    }
+
+def _cache_latest_frame(serial_number, frame_entry):
+    with _latest_frames_lock:
+        _latest_frames[serial_number] = frame_entry
+
+def _normalize_frame_entry(serial_number, frame_data):
+    if not frame_data:
+        jpeg_bytes = _generate_mock_jpeg(serial_number, 0)
+        return _build_frame_entry(jpeg_bytes, 0, "Mono8", "image/jpeg", 640, 480, "jpg",
+            jpeg_bytes=jpeg_bytes, source="fallback")
+
+    if isinstance(frame_data, dict):
+        frame_entry = dict(frame_data)
+        if not frame_entry.get("jpeg_bytes"):
+            if frame_entry.get("content_type") == "image/jpeg":
+                frame_entry["jpeg_bytes"] = frame_entry.get("frame_bytes")
+            else:
+                frame_entry["jpeg_bytes"] = _generate_mock_jpeg(serial_number, 0)
+        if not frame_entry.get("extension"):
+            frame_entry["extension"] = _default_extension(frame_entry.get("content_type"), frame_entry.get("data_format"))
+        return frame_entry
+
+    if isinstance(frame_data, tuple):
+        if frame_data[1] == 1:
+            return _build_frame_entry(frame_data[0], frame_data[1], frame_data[2], "application/octet-stream",
+                extension="npy", jpeg_bytes=_generate_mock_jpeg(serial_number, 0), source="cache")
+        return _build_frame_entry(frame_data[0], frame_data[1], frame_data[2], "image/jpeg",
+            extension="jpg", jpeg_bytes=frame_data[0], source="cache")
+
+    raise ValueError(f"Unsupported frame cache entry type for camera {serial_number}: {type(frame_data)}")
+
+def _write_frame_entry_files(serial_number, frame_entry, output_dir, prefix):
+    _ensure_output_dir(output_dir)
+
+    extension = frame_entry.get("extension") or "bin"
+    frame_path = os.path.join(output_dir, f"{prefix}_{serial_number}.{extension}")
+    with open(frame_path, "wb") as f:
+        f.write(frame_entry["frame_bytes"])
+
+    result = {"snapshot_location": frame_path.replace("\\", "/")}
+    jpeg_bytes = frame_entry.get("jpeg_bytes")
+    if jpeg_bytes and (frame_entry.get("content_type") != "image/jpeg" or extension != "jpg"):
+        preview_path = os.path.join(output_dir, f"{prefix}_{serial_number}_preview.jpg")
+        with open(preview_path, "wb") as f:
+            f.write(jpeg_bytes)
+        result["preview_location"] = preview_path.replace("\\", "/")
+
+    return result
+
+
+def _open_video_writer(output_dir, serial_number, fps_value, frame_size, video_container=None, video_codec=None):
+    preferred_container = _normalize_video_container(video_container)
+    preferred_codec = _normalize_video_codec(video_codec)
+    candidates = [(preferred_container, preferred_codec)]
+
+    for candidate in [("avi", "MJPG"), ("avi", "XVID"), ("mp4", "mp4v")]:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    last_path = None
+    for extension, codec in candidates:
+        video_path = os.path.join(output_dir, f"video_{serial_number}.{extension}")
+        writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*codec), fps_value, frame_size)
+        if writer.isOpened():
+            return writer, video_path, codec
+        writer.release()
+        last_path = video_path
+
+    raise RuntimeError(f"Could not open a supported video writer for {last_path}")
+
+def _component_data_format(component):
+    if hasattr(component, 'data_format_name'):
+        return component.data_format_name
+    if hasattr(component, 'data_format'):
+        return str(component.data_format)
+    return "Unknown"
+
+def _encode_component_bytes(component, component_index=0, image_format="jpg", resize_width=None, resize_height=None):
+    data_format = _component_data_format(component)
+    img = convert_to_numpy_array(component)
+    if img is not None and HAS_OPENCV:
+        img = _resize_image_if_needed(img, resize_width=resize_width, resize_height=resize_height)
+        encoded_bytes, normalized_format, content_type = _encode_image_bytes(img, image_format)
+        jpeg_bytes = encoded_bytes if normalized_format == "jpg" else None
+        if normalized_format != "jpg":
+            jpeg_bytes, _, _ = _encode_image_bytes(img, "jpg")
+        return _build_frame_entry(encoded_bytes, component_index, data_format, content_type,
+            img.shape[1], img.shape[0], normalized_format, jpeg_bytes=jpeg_bytes)
+
+    raw_bytes = component.data.tobytes() if hasattr(component.data, 'tobytes') else bytes(component.data)
+    return _build_frame_entry(raw_bytes, component_index, data_format, "application/octet-stream",
+        component.width, component.height, "bin")
+
+def _fetch_single_capture(cti_path, serial_number, image_format="jpg", resize_width=None, resize_height=None):
+    normalized_format = _normalize_image_format(image_format)
+    if _is_mock(cti_path, serial_number):
+        jpeg_bytes = _generate_mock_jpeg(serial_number, 0)
+        frame_entry = _build_frame_entry(jpeg_bytes, 0, "Mono8", "image/jpeg", 640, 480, "jpg",
+            jpeg_bytes=jpeg_bytes)
+        frame_entry = _reencode_frame_entry(frame_entry, normalized_format)
+        if resize_width is not None or resize_height is not None:
+            frame_entry = _resize_frame_entry(frame_entry, resize_width=resize_width, resize_height=resize_height)
+        return frame_entry
+
+    conn = get_connection(cti_path, serial_number)
+    ia = conn.acquirer
+    started_here = False
+    if not ia.is_acquiring():
+        ia.start()
+        started_here = True
+
+    try:
+        with ia.fetch() as buffer:
+            payload = buffer.payload
+            payload_type = getattr(payload, 'type', None)
+            components = getattr(payload, 'components', [])
+            if payload_type in (6, 7):
+                res = handle_3d_payload(buffer)
+                return _build_frame_entry(res["npy_bytes"], 0, res["data_format"], "application/octet-stream",
+                    res["width"], res["height"], "npy", jpeg_bytes=_generate_mock_jpeg(serial_number, 0))
+            if not components:
+                raise ValueError(f"No payload components available for camera {serial_number}")
+            return _encode_component_bytes(components[0], 0, normalized_format,
+                resize_width=resize_width, resize_height=resize_height)
+    finally:
+        if started_here:
+            ia.stop()
+
+def acquire_single_image(cti_path, serial_number, output_dir=DEFAULT_IMAGES_DIR, image_format="jpg",
+        resize_width=None, resize_height=None):
+    logger.info(f"Acquiring single image from camera {serial_number}")
+    _ensure_output_dir(output_dir)
+
+    capture = _fetch_single_capture(cti_path, serial_number, image_format=image_format,
+        resize_width=resize_width, resize_height=resize_height)
+    capture.update(_write_frame_entry_files(serial_number, capture, output_dir, "single"))
+    capture["file_path"] = capture["snapshot_location"]
+    return capture
+
+def acquire_video_file(cti_path, serial_number, num_frames=60, fps=15.0, output_dir=DEFAULT_VIDEOS_DIR,
+        video_container="avi", video_codec="MJPG", resize_width=None, resize_height=None):
+    logger.info(f"Recording video file of {num_frames} frames from camera {serial_number} at {fps} FPS")
+    _ensure_output_dir(output_dir)
+    fps_value = float(fps) if fps else 15.0
+
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV (cv2) is required to generate a video file.")
+
+    frame_size = None
+    writer = None
+    video_path = None
+    video_codec = None
+
+    frame_count = 0
+    try:
+        for frame_idx in range(num_frames):
+            if _is_mock(cti_path, serial_number):
+                jpeg_bytes = _generate_mock_jpeg(serial_number, frame_idx)
+                frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                frame = _resize_image_if_needed(frame, resize_width=resize_width, resize_height=resize_height)
+            else:
+                capture = _fetch_single_capture(cti_path, serial_number, resize_width=resize_width, resize_height=resize_height)
+                if capture.get("extension") != "jpg":
+                    raise RuntimeError("Video recording currently supports only 2D image payloads.")
+                frame = cv2.imdecode(np.frombuffer(capture["frame_bytes"], dtype=np.uint8), cv2.IMREAD_COLOR)
+
+            if frame is None:
+                raise RuntimeError(f"Could not decode frame {frame_idx} for video recording.")
+
+            if frame_size is None:
+                frame_size = (frame.shape[1], frame.shape[0])
+                writer, video_path, video_codec = _open_video_writer(output_dir, serial_number, fps_value,
+                    frame_size, video_container=video_container, video_codec=video_codec)
+                logger.info(f"Recording video for camera {serial_number} to {video_path} using codec {video_codec}")
+
+            if (frame.shape[1], frame.shape[0]) != frame_size:
+                frame = cv2.resize(frame, frame_size)
+
+            writer.write(frame)
+            frame_count += 1
+    finally:
+        if writer is not None:
+            writer.release()
+
+    return {
+        "video_path": video_path.replace("\\", "/"),
+        "acquired_frames": frame_count,
+        "fps": fps_value,
+        "codec": video_codec,
+        "container": os.path.splitext(video_path)[1].lstrip(".").lower()
+    }
+
+def acquire_visual_servo_frame(cti_path, serial_number, use_cached=True, save_snapshot=False,
+        output_dir=DEFAULT_SERVO_DIR, image_format="jpg", resize_width=None, resize_height=None):
+    logger.info(f"Acquiring visual servo frame from camera {serial_number} (use_cached={use_cached}, save_snapshot={save_snapshot})")
+
+    frame_entry = None
+    if use_cached:
+        with _latest_frames_lock:
+            frame_entry = _latest_frames.get(serial_number, None)
+        frame_entry = _normalize_frame_entry(serial_number, frame_entry) if frame_entry else None
+
+    if frame_entry is None:
+        frame_entry = _fetch_single_capture(cti_path, serial_number, image_format=image_format,
+            resize_width=resize_width, resize_height=resize_height)
+        frame_entry["source"] = "capture"
+    else:
+        frame_entry["source"] = "cache"
+        frame_entry = _reencode_frame_entry(frame_entry, image_format)
+        if resize_width is not None or resize_height is not None:
+            frame_entry = _resize_frame_entry(frame_entry, resize_width=resize_width, resize_height=resize_height)
+
+    if save_snapshot:
+        frame_entry.update(_write_frame_entry_files(serial_number, frame_entry, output_dir, "servo"))
+
+    return frame_entry
+
 class AcquisitionThread(threading.Thread):
     def __init__(self, cti_path, serial_number):
         super().__init__(name=f"AcqThread-{serial_number}")
@@ -543,8 +840,9 @@ class AcquisitionThread(threading.Thread):
                     time.sleep(0.1) # Simulate 10 FPS
                     self.mock_frame_index += 1
                     jpeg_bytes = _generate_mock_jpeg(self.serial_number, self.mock_frame_index)
-                    with _latest_frames_lock:
-                        _latest_frames[self.serial_number] = (jpeg_bytes, 0, "Mono8")
+                    _cache_latest_frame(self.serial_number,
+                        _build_frame_entry(jpeg_bytes, 0, "Mono8", "image/jpeg", 640, 480, "jpg",
+                            jpeg_bytes=jpeg_bytes, source="stream"))
                 except Exception as e:
                     logger.error(f"Error in mock acquisition loop: {e}")
                 continue
@@ -575,22 +873,14 @@ class AcquisitionThread(threading.Thread):
                             if payload_type in (6, 7):
                                 logger.info(f"Intercepted GenDC/Multi-Part 3D payload of type {payload_type} in streaming thread")
                                 res = handle_3d_payload(buffer)
-                                with _latest_frames_lock:
-                                    _latest_frames[self.serial_number] = (res["npy_bytes"], 1, res["data_format"])
+                                _cache_latest_frame(self.serial_number,
+                                    _build_frame_entry(res["npy_bytes"], 1, res["data_format"], "application/octet-stream",
+                                        res["width"], res["height"], "npy",
+                                        jpeg_bytes=_generate_mock_jpeg(self.serial_number, 0), source="stream"))
                             else:
                                 # Standard component resolution
                                 comp = components[0]
-                                img = convert_to_numpy_array(comp)
-                                
-                                if img is not None and HAS_OPENCV:
-                                    success, encoded_img = cv2.imencode('.jpg', img)
-                                    if success:
-                                        jpeg_bytes = encoded_img.tobytes()
-                                        with _latest_frames_lock:
-                                            _latest_frames[self.serial_number] = (jpeg_bytes, 0, getattr(comp, 'data_format_name', 'Mono8'))
-                                else:
-                                    with _latest_frames_lock:
-                                        _latest_frames[self.serial_number] = (comp.data.tobytes(), 0, getattr(comp, 'data_format_name', 'Mono8'))
+                                _cache_latest_frame(self.serial_number, _encode_component_bytes(comp, 0) | {"source":"stream"})
                     except Exception as e:
                         # Timeout exceptions are expected when frame rates are low
                         if "Timeout" in type(e).__name__ or "timeout" in str(e).lower():
@@ -652,16 +942,10 @@ def _stop_stream(serial_number):
 
 def _write_latest_frame_file(serial_number):
     """Writes the latest cached frame bytes to disk and returns its file path."""
-    with _latest_frames_lock:
-        frame_data = _latest_frames.get(serial_number, None)
-    
-    if not frame_data:
-        # If no frame is cached, generate a default one
-        jpeg_bytes = _generate_mock_jpeg(serial_number, 0)
-    else:
-        jpeg_bytes = frame_data[0]
+    frame_entry = _get_latest_frame_entry(serial_number)
+    jpeg_bytes = frame_entry.get("jpeg_bytes") or _generate_mock_jpeg(serial_number, 0)
         
-    frames_dir = "runtime/genicam/frames"
+    frames_dir = DEFAULT_FRAMES_DIR
     os.makedirs(frames_dir, exist_ok=True)
     frame_path = os.path.join(frames_dir, f"latest_{serial_number}.jpg")
     
@@ -669,6 +953,11 @@ def _write_latest_frame_file(serial_number):
         f.write(jpeg_bytes)
         
     return frame_path
+
+def _get_latest_frame_entry(serial_number):
+    with _latest_frames_lock:
+        frame_data = _latest_frames.get(serial_number, None)
+    return _normalize_frame_entry(serial_number, frame_data)
 
 def read_camera_parameters(cti_path, serial_number, parameter_names):
     """Reads current parameter values from camera."""
@@ -777,7 +1066,8 @@ def write_camera_parameters(cti_path, serial_number, parameters_map):
     logger.info(f"Write results: {result}")
     return result
 
-def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="runtime/genicam/frames"):
+def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir=DEFAULT_FRAMES_DIR, image_format="jpg",
+        resize_width=None, resize_height=None):
     """Starts acquisition, fetches a number of frames, and stops acquisition."""
     logger.info(f"Acquiring video stream of {num_frames} frames from camera {serial_number}")
     os.makedirs(output_dir, exist_ok=True)
@@ -787,10 +1077,16 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
         mock_files = []
         for i in range(num_frames):
             time.sleep(0.1) # Simulate frame time
-            frame_path = os.path.join(output_dir, f"frame_{i:04d}_0.jpg")
+            normalized_format = _normalize_image_format(image_format)
+            frame_path = os.path.join(output_dir, f"frame_{i:04d}_0.{normalized_format}")
             jpeg_bytes = _generate_mock_jpeg(serial_number, i)
+            image_bytes = jpeg_bytes
+            if normalized_format != "jpg" or resize_width is not None or resize_height is not None:
+                image_array = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                image_array = _resize_image_if_needed(image_array, resize_width=resize_width, resize_height=resize_height)
+                image_bytes = _encode_image_bytes(image_array, normalized_format)[0]
             with open(frame_path, "wb") as f:
-                f.write(jpeg_bytes)
+                f.write(image_bytes)
             mock_files.append(frame_path)
             logger.info(f"Mock acquired frame {i} saved to {frame_path}")
         return {"acquired_frames": mock_files}
@@ -822,8 +1118,9 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
                         img = convert_to_numpy_array(comp)
                         
                         if img is not None and HAS_OPENCV:
-                          # Determine standard extension based on conversion success
-                          frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.jpg")
+                          normalized_format = _normalize_image_format(image_format)
+                          frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.{normalized_format}")
+                          img = _resize_image_if_needed(img, resize_width=resize_width, resize_height=resize_height)
                           cv2.imwrite(frame_path, img)
                         else:
                           frame_path = os.path.join(output_dir, f"frame_{i:04d}_{c_idx}.bin")
@@ -844,36 +1141,58 @@ def acquire_video_stream(cti_path, serial_number, num_frames=10, output_dir="run
 
 def run_action(action, cti_path, serial_number, parameter_names=None, parameters_map=None, ec=None, device_id=None):
     """Router function called from JEP."""
-    global _ec_local, _device_id
-    _ec_local = ec
-    _device_id = device_id
     try:
         if action == "read":
             return read_camera_parameters(cti_path, serial_number, parameter_names or [])
         elif action == "write":
             return write_camera_parameters(cti_path, serial_number, parameters_map or {})
+        elif action == "single_image":
+            output_dir = _map_get(parameters_map, "output_dir", DEFAULT_IMAGES_DIR)
+            image_format = _map_get(parameters_map, "image_format", "jpg")
+            resize_width = _map_get(parameters_map, "resize_width", None)
+            resize_height = _map_get(parameters_map, "resize_height", None)
+            return acquire_single_image(cti_path, serial_number, output_dir=output_dir, image_format=image_format,
+                resize_width=resize_width, resize_height=resize_height)
         elif action == "video":
-            num_frames = parameters_map.get("num_frames", 10) if parameters_map else 10
-            output_dir = parameters_map.get("output_dir", "runtime/genicam/frames") if parameters_map else "runtime/genicam/frames"
-            return acquire_video_stream(cti_path, serial_number, num_frames=num_frames, output_dir=output_dir)
+            num_frames = _map_get(parameters_map, "num_frames", 10)
+            output_dir = _map_get(parameters_map, "output_dir", DEFAULT_FRAMES_DIR)
+            image_format = _map_get(parameters_map, "image_format", "jpg")
+            resize_width = _map_get(parameters_map, "resize_width", None)
+            resize_height = _map_get(parameters_map, "resize_height", None)
+            return acquire_video_stream(cti_path, serial_number, num_frames=num_frames,
+                output_dir=output_dir, image_format=image_format, resize_width=resize_width, resize_height=resize_height)
+        elif action == "video_file":
+            num_frames = _map_get(parameters_map, "num_frames", 60)
+            fps = _map_get(parameters_map, "fps", 15.0)
+            output_dir = _map_get(parameters_map, "output_dir", DEFAULT_VIDEOS_DIR)
+            video_container = _map_get(parameters_map, "video_container", "avi")
+            video_codec = _map_get(parameters_map, "video_codec", "MJPG")
+            resize_width = _map_get(parameters_map, "resize_width", None)
+            resize_height = _map_get(parameters_map, "resize_height", None)
+            return acquire_video_file(cti_path, serial_number, num_frames=num_frames, fps=fps,
+                output_dir=output_dir, video_container=video_container, video_codec=video_codec,
+                resize_width=resize_width, resize_height=resize_height)
         elif action == "acquire_3d_frame":
             return acquire_3d_frame(cti_path, serial_number)
         elif action == "close_all":
             close_all_connections()
             return {"status": "success"}
         elif action == "get_frame":
-            # Direct retrieval of latest cached JPEG frame
-            with _latest_frames_lock:
-                frame_data = _latest_frames.get(serial_number, None)
-            if frame_data:
-                # If it's a 3D npy file, return the mock jpeg instead for safety in MJPEG view
-                if frame_data[1] == 1:
-                    return {"jpeg_bytes": _generate_mock_jpeg(serial_number, 0)}
-                return {"jpeg_bytes": frame_data[0]}
-            else:
-                return {"jpeg_bytes": _generate_mock_jpeg(serial_number, 0)}
+            return {"jpeg_bytes": _get_latest_frame_entry(serial_number)["jpeg_bytes"]}
+        elif action == "get_frame_payload":
+            return _get_latest_frame_entry(serial_number)
+        elif action == "visual_servo_frame":
+            use_cached = _bool_value(_map_get(parameters_map, "use_cached", True), True)
+            save_snapshot = _bool_value(_map_get(parameters_map, "save_snapshot", False), False)
+            output_dir = _map_get(parameters_map, "output_dir", DEFAULT_SERVO_DIR)
+            image_format = _map_get(parameters_map, "image_format", "jpg")
+            resize_width = _map_get(parameters_map, "resize_width", None)
+            resize_height = _map_get(parameters_map, "resize_height", None)
+            return acquire_visual_servo_frame(cti_path, serial_number, use_cached=use_cached,
+                save_snapshot=save_snapshot, output_dir=output_dir, image_format=image_format,
+                resize_width=resize_width, resize_height=resize_height)
         else:
             raise ValueError(f"Unknown action: {action}")
     except Exception as e:
-        update_device_status_to_error()
+        update_device_status_to_error(ec, device_id)
         raise e

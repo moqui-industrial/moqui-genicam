@@ -174,6 +174,77 @@ class GenicamServiceTests extends Specification {
             npyFile.length() > 0
     }
 
+    def "test acquire single image (mock fallback)"() {
+        when: "calling the acquire#SingleImage service"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#SingleImage")
+                .parameter("deviceId", "FLIR_CAMERA_1").call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        and: "a valid image descriptor is returned"
+            res.imageLocation != null
+            res.imageFormat == "jpg"
+            res.contentType == "image/jpeg"
+            res.width == 640
+            res.height == 480
+
+        and: "the saved image file exists on the filesystem and is non-empty"
+            File imageFile = new File(res.imageLocation)
+            imageFile.exists()
+            imageFile.length() > 0
+    }
+
+    def "test acquire video file (mock fallback)"() {
+        when: "calling the acquire#VideoFile service"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#VideoFile")
+                .parameter("deviceId", "FLIR_CAMERA_1")
+                .parameter("numFrames", 10)
+                .parameter("fps", 10.0G)
+                .call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        and: "a valid video descriptor is returned"
+            res.videoLocation != null
+            res.acquiredFrames == 10
+            res.fps == 10.0G
+
+        and: "the saved video file exists on the filesystem and is non-empty"
+            File videoFile = new File(res.videoLocation)
+            videoFile.exists()
+            videoFile.length() > 0
+    }
+
+    def "test acquire visual servo frame (mock fallback)"() {
+        when: "calling the acquire#VisualServoFrame service"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#VisualServoFrame")
+                .parameter("deviceId", "FLIR_CAMERA_1")
+                .parameter("useCachedFrame", false)
+                .parameter("saveSnapshot", true)
+                .call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        and: "a valid frame payload is returned"
+            res.frameBytes != null
+            ((byte[]) res.frameBytes).length > 0
+            res.contentType == "image/jpeg"
+            res.dataFormat == "Mono8"
+            res.frameFormat == "jpg"
+            res.width == 640
+            res.height == 480
+            res.source == "capture"
+
+        and: "the saved snapshot exists on the filesystem and is non-empty"
+            res.snapshotLocation != null
+            File snapshotFile = new File(res.snapshotLocation)
+            snapshotFile.exists()
+            snapshotFile.length() > 0
+    }
+
     def "test clean tensors service job"() {
         given: "a tensor file and DB record exist"
             Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#GenICam3DFrame")

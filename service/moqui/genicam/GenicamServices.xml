@@ -20,157 +20,104 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="run" noun="GenICamRequest" authenticate="false" transaction="ignore">
         <description>Implements the run#DeviceRequestInternal interface for GenICam vision cameras using moqui-jep.</description>
         <implements service="moqui.device.DeviceServices.run#DeviceRequestInternal"/>
+        <actions><script><![CDATA[
+            import org.moqui.context.ExecutionContext
+            import org.moqui.genicam.GenicamClient
+            import org.moqui.genicam.GenicamUtil
+
+            if (!connection) throw new IllegalArgumentException("A connection instance is required for GenICam to communicate with the camera ${request.deviceId}. Device request with name ${request.requestName}, aborted.")
+            if (!connection.transportConfig) throw new IllegalArgumentException("Connection transportConfig must specify the absolute path to the .cti GenTL driver.")
+
+            ExecutionContext ec = context.ec
+            String ctiPath = connection.transportConfig
+            String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+
+            ec.logger.info("Connecting to camera with ID ${request.deviceId} using CTI ${ctiPath}.")
+            try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, request.deviceId)) {
+                if ("DrtRead" == request.requestTypeEnumId) {
+                    client.read(request, requestItemList)
+                } else if ("DrtWrite" == request.requestTypeEnumId) {
+                    client.write(request, requestItemList)
+                } else {
+                    throw new IllegalArgumentException("Unsupported device request type ${request.requestTypeEnumId}. Could not send the device request with name ${request.requestName}.")
+                }
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="acquire" noun="SingleImage" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceId" required="true"/>
+            <parameter name="connectionName"/>
+            <parameter name="outputDir"/>
+            <parameter name="imageFormat"/>
+            <parameter name="resizeWidth" type="Integer"/>
+            <parameter name="resizeHeight" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="imageLocation"/>
+            <parameter name="imageFormat"/>
+            <parameter name="contentType"/>
+            <parameter name="width" type="Integer"/>
+            <parameter name="height" type="Integer"/>
+        </out-parameters>
         <actions>
+            <!-- Resolve PhysicalDevice -->
+            <entity-find-one entity-name="moqui.device.Device" value-field="device"/>
+            <if condition="!device">
+                <message error="true">Device not found with ID: ${deviceId}</message>
+                <check-errors/>
+            </if>
+
+            <!-- Resolve Connection -->
+            <if condition="connectionName">
+                <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                    <field-map field-name="connectionName" from="connectionName"/>
+                </entity-find-one>
+                <else>
+                    <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                        <field-map field-name="deviceId" from="deviceId"/>
+                    </entity-find-one>
+                </else>
+            </if>
             <if condition="!connection">
-                <message error="true">A connection instance is required for GenICam to communicate with the camera. Request name: ${request?.requestName}</message>
+                <message error="true">Connection not found for device: ${deviceId}</message>
                 <check-errors/>
             </if>
 
             <set field="ctiPath" from="connection.transportConfig"/>
             <if condition="!ctiPath">
-                <message error="true">Connection transportConfig must specify the absolute path to the .cti GenTL driver.</message>
+                <message error="true">Connection transportConfig must specify driver path.</message>
                 <check-errors/>
             </if>
 
-            <set field="serialNumber" from="device?.serialNumber"/>
-            <if condition="connection.options">
-                <script><![CDATA[
-                    Map optsMap = [:]
-                    connection.options.split(",")*.trim().each {
-                        def parts = it.split("=")
-                        if (parts.length == 2) optsMap.put(parts[0], parts[1])
-                    }
-                    if (optsMap.serial) serialNumber = optsMap.serial
-                ]]></script>
-            </if>
-            <if condition="!serialNumber">
-                <set field="serialNumber" from="connection.connectionName"/>
-            </if>
-
-            <!-- Execute GenICam Request via JEP -->
             <script><![CDATA[
                 import org.moqui.context.ExecutionContext
-                import org.moqui.impl.tools.JepToolFactory
-                import jep.Interpreter
-                import org.moqui.entity.EntityValue
-                import org.moqui.entity.EntityCondition
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
 
                 ExecutionContext ec = context.ec
-                final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.images.path", GenicamUtil.DEFAULT_IMAGES_PATH)
+                String resolvedImageFormat = GenicamUtil.resolveImageFormat(ec, imageFormat)
+                Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.images.resize.width")
+                Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.images.resize.height")
                 Map<String, Object> pyResults = [:]
-                
-                try (Interpreter interpreter = tool.getInterpreter()) {
-                    URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
-                    String scriptDir = ""
-                    if (scriptUrl != null) {
-                        try {
-                            scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
-                        } catch (Throwable t) {
-                            scriptDir = scriptUrl.getPath()
-                            if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
-                            if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
-                        }
-                    }
-                    if (!scriptDir) {
-                        scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
-                        if (scriptDir.startsWith("file:")) {
-                            scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
-                        }
-                    }
-                    scriptDir = scriptDir.replace('\\', '/')
-                    interpreter.exec("import sys")
-                    interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
-                    
-                    interpreter.set("cti_path", ctiPath)
-                    interpreter.set("serial_number", serialNumber)
-                    interpreter.set("device_id", device.deviceId)
-                    interpreter.set("ec", ec)
-                    
-                    if ("DrtRead" == request.requestTypeEnumId) {
-                        List<String> paramNames = requestItemList*.query
-                        interpreter.set("action", "read")
-                        interpreter.set("parameter_names", paramNames)
-                        interpreter.set("parameters_map", null)
-                        
-                        ec.logger.info("Executing JEP GenICam Read request for camera ${serialNumber}")
-                        interpreter.exec("import genicam_bridge")
-                        interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameter_names=parameter_names, ec=ec, device_id=device_id)")
-                        
-                        pyResults = (Map<String, Object>) interpreter.getValue("result")
-                        
-                    } else if ("DrtWrite" == request.requestTypeEnumId) {
-                        Map<String, Object> paramsMap = [:]
-                        
-                        requestItemList.each { EntityValue item ->
-                            EntityValue parameter = ec.entity.find("moqui.math.Parameter")
-                                .condition("parameterId", item.parameterId).one()
-                            if (parameter) {
-                                Object val = parameter.numericValue != null ? parameter.numericValue : parameter.symbolicValue
-                                if (val == null) val = parameter.parameterEnumId
-                                if (val != null) {
-                                    paramsMap.put(item.query, val)
-                                }
-                            }
-                        }
-                        
-                        interpreter.set("action", "write")
-                        interpreter.set("parameter_names", null)
-                        interpreter.set("parameters_map", paramsMap)
-                        
-                        ec.logger.info("Executing JEP GenICam Write request for camera ${serialNumber} with parameters: ${paramsMap}")
-                        interpreter.exec("import genicam_bridge")
-                        interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map, ec=ec, device_id=device_id)")
-                        
-                        pyResults = (Map<String, Object>) interpreter.getValue("result")
-                    } else {
-                        throw new IllegalArgumentException("Unsupported device request type: ${request.requestTypeEnumId} for GenICam camera.")
-                    }
+
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
+                    pyResults = client.acquireSingleImage(resolvedOutputDir, resolvedImageFormat,
+                            resolvedResizeWidth, resolvedResizeHeight)
                 } catch (Throwable t) {
-                    ec.logger.error("GenICam JEP action execution failed", t)
+                    ec.logger.error("GenICam JEP single image acquisition failed", t)
                     throw t
                 }
 
-                // sync Python results back to Moqui DB parameters
-                if (pyResults) {
-                    pyResults.each { String key, Object val ->
-                        EntityValue item = requestItemList.find { it.query == key }
-                        if (item) {
-                            EntityValue parameter = ec.entity.find("moqui.math.Parameter")
-                                .condition("parameterId", item.parameterId).useCache(false).one()
-                            
-                            if (parameter) {
-                                parameter = parameter.cloneValue()
-                                boolean isNumeric = val instanceof Number
-                                if (isNumeric) {
-                                    parameter.numericValue = (BigDecimal) val
-                                    parameter.symbolicValue = null
-                                } else {
-                                    parameter.numericValue = null
-                                    parameter.symbolicValue = val?.toString()
-                                }
-                                parameter.update()
-                                
-                                long nextSeq = ec.entity.find("moqui.math.ParameterLog")
-                                    .condition("parameterId", parameter.parameterId)
-                                    .count() + 1
-                                
-                                EntityValue logEntry = ec.entity.makeValue("moqui.math.ParameterLog")
-                                logEntry.setSequencedIdPrimary()
-                                logEntry.parameterId = parameter.parameterId
-                                logEntry.sequenceNum = nextSeq
-                                logEntry.observedDate = ec.user.nowTimestamp
-                                if (isNumeric) {
-                                    logEntry.numericValue = (BigDecimal) val
-                                } else {
-                                    logEntry.symbolicValue = val?.toString()
-                                }
-                                logEntry.create()
-                                
-                                ec.logger.info("Synchronized Parameter ${parameter.parameterId} (${key}) to value: ${val}")
-                            }
-                        }
-                    }
-                }
+                context.imageLocation = pyResults?.get("file_path")
+                context.imageFormat = pyResults?.get("extension")
+                context.contentType = pyResults?.get("content_type")
+                context.width = pyResults?.get("width")
+                context.height = pyResults?.get("height")
             ]]></script>
         </actions>
     </service>
@@ -180,7 +127,10 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
             <parameter name="numFrames" type="Integer" default="10"/>
-            <parameter name="outputDir" default-value="runtime/genicam/frames"/>
+            <parameter name="outputDir"/>
+            <parameter name="imageFormat"/>
+            <parameter name="resizeWidth" type="Integer"/>
+            <parameter name="resizeHeight" type="Integer"/>
         </in-parameters>
         <out-parameters>
             <parameter name="acquiredFrames" type="List"/>
@@ -215,73 +165,204 @@ along with this software (see the LICENSE.md file). If not, see
                 <check-errors/>
             </if>
             
-            <set field="serialNumber" from="device.serialNumber"/>
-            <if condition="connection.options">
-                <script><![CDATA[
-                    Map optsMap = [:]
-                    connection.options.split(",")*.trim().each {
-                        def parts = it.split("=")
-                        if (parts.length == 2) optsMap.put(parts[0], parts[1])
-                    }
-                    if (optsMap.serial) serialNumber = optsMap.serial
-                ]]></script>
-            </if>
-            <if condition="!serialNumber">
-                <set field="serialNumber" from="connection.connectionName"/>
-            </if>
-
-            <!-- Execute JEP GenICam Video Stream -->
             <script><![CDATA[
                 import org.moqui.context.ExecutionContext
-                import org.moqui.impl.tools.JepToolFactory
-                import jep.Interpreter
-                import org.moqui.entity.EntityValue
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
 
                 ExecutionContext ec = context.ec
-                final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.frames.path", GenicamUtil.DEFAULT_FRAMES_PATH)
+                String resolvedImageFormat = GenicamUtil.resolveImageFormat(ec, imageFormat)
+                Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.frames.resize.width")
+                Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.frames.resize.height")
                 Map<String, Object> pyResults = [:]
-                
-                try (Interpreter interpreter = tool.getInterpreter()) {
-                    URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
-                    String scriptDir = ""
-                    if (scriptUrl != null) {
-                        try {
-                            scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
-                        } catch (Throwable t) {
-                            scriptDir = scriptUrl.getPath()
-                            if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
-                            if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
-                        }
-                    }
-                    if (!scriptDir) {
-                        scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
-                        if (scriptDir.startsWith("file:")) {
-                            scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
-                        }
-                    }
-                    scriptDir = scriptDir.replace('\\', '/')
-                    interpreter.exec("import sys")
-                    interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
-                    
-                    interpreter.set("cti_path", ctiPath)
-                    interpreter.set("serial_number", serialNumber)
-                    interpreter.set("device_id", deviceId)
-                    interpreter.set("ec", ec)
-                    interpreter.set("action", "video")
-                    interpreter.set("parameter_names", null)
-                    interpreter.set("parameters_map", [num_frames: numFrames, output_dir: outputDir])
-                    
-                    ec.logger.info("Executing JEP GenICam Video Stream request for camera ${serialNumber}")
-                    interpreter.exec("import genicam_bridge")
-                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, parameters_map=parameters_map, ec=ec, device_id=device_id)")
-                    
-                    pyResults = (Map<String, Object>) interpreter.getValue("result")
+
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
+                    pyResults = client.acquireVideoStream(numFrames, resolvedOutputDir, resolvedImageFormat,
+                            resolvedResizeWidth, resolvedResizeHeight)
                 } catch (Throwable t) {
                     ec.logger.error("GenICam JEP video stream acquisition failed", t)
                     throw t
                 }
 
                 context.acquiredFrames = pyResults?.get("acquired_frames")
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="acquire" noun="VideoFile" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceId" required="true"/>
+            <parameter name="connectionName"/>
+            <parameter name="numFrames" type="Integer" default="60"/>
+            <parameter name="fps" type="BigDecimal" default="15.0"/>
+            <parameter name="outputDir"/>
+            <parameter name="videoContainer"/>
+            <parameter name="videoCodec"/>
+            <parameter name="resizeWidth" type="Integer"/>
+            <parameter name="resizeHeight" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="videoLocation"/>
+            <parameter name="acquiredFrames" type="Integer"/>
+            <parameter name="fps" type="BigDecimal"/>
+            <parameter name="videoContainer"/>
+            <parameter name="videoCodec"/>
+        </out-parameters>
+        <actions>
+            <!-- Resolve PhysicalDevice -->
+            <entity-find-one entity-name="moqui.device.Device" value-field="device"/>
+            <if condition="!device">
+                <message error="true">Device not found with ID: ${deviceId}</message>
+                <check-errors/>
+            </if>
+
+            <!-- Resolve Connection -->
+            <if condition="connectionName">
+                <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                    <field-map field-name="connectionName" from="connectionName"/>
+                </entity-find-one>
+                <else>
+                    <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                        <field-map field-name="deviceId" from="deviceId"/>
+                    </entity-find-one>
+                </else>
+            </if>
+            <if condition="!connection">
+                <message error="true">Connection not found for device: ${deviceId}</message>
+                <check-errors/>
+            </if>
+
+            <set field="ctiPath" from="connection.transportConfig"/>
+            <if condition="!ctiPath">
+                <message error="true">Connection transportConfig must specify driver path.</message>
+                <check-errors/>
+            </if>
+
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
+
+                ExecutionContext ec = context.ec
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.videos.path", GenicamUtil.DEFAULT_VIDEOS_PATH)
+                String resolvedVideoContainer = GenicamUtil.resolveVideoContainer(ec, videoContainer)
+                String resolvedVideoCodec = GenicamUtil.resolveVideoCodec(ec, videoCodec)
+                Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.videos.resize.width")
+                Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.videos.resize.height")
+                Map<String, Object> pyResults = [:]
+
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
+                    pyResults = client.acquireVideoFile(numFrames, fps, resolvedOutputDir,
+                            resolvedVideoContainer, resolvedVideoCodec, resolvedResizeWidth, resolvedResizeHeight)
+                } catch (Throwable t) {
+                    ec.logger.error("GenICam JEP video file acquisition failed", t)
+                    throw t
+                }
+
+                context.videoLocation = pyResults?.get("video_path")
+                context.acquiredFrames = pyResults?.get("acquired_frames")
+                context.fps = pyResults?.get("fps")
+                context.videoContainer = pyResults?.get("container")
+                context.videoCodec = pyResults?.get("codec")
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="acquire" noun="VisualServoFrame" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceId" required="true"/>
+            <parameter name="connectionName"/>
+            <parameter name="useCachedFrame" type="Boolean" default="true"/>
+            <parameter name="saveSnapshot" type="Boolean" default="false"/>
+            <parameter name="outputDir"/>
+            <parameter name="imageFormat"/>
+            <parameter name="resizeWidth" type="Integer"/>
+            <parameter name="resizeHeight" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="frameBytes"/>
+            <parameter name="jpegBytes"/>
+            <parameter name="contentType"/>
+            <parameter name="dataFormat"/>
+            <parameter name="frameFormat"/>
+            <parameter name="componentIndex" type="Integer"/>
+            <parameter name="width" type="Integer"/>
+            <parameter name="height" type="Integer"/>
+            <parameter name="capturedAt"/>
+            <parameter name="source"/>
+            <parameter name="snapshotLocation"/>
+            <parameter name="previewLocation"/>
+        </out-parameters>
+        <actions>
+            <!-- Resolve PhysicalDevice -->
+            <entity-find-one entity-name="moqui.device.Device" value-field="device"/>
+            <if condition="!device">
+                <message error="true">Device not found with ID: ${deviceId}</message>
+                <check-errors/>
+            </if>
+
+            <!-- Resolve Connection -->
+            <if condition="connectionName">
+                <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                    <field-map field-name="connectionName" from="connectionName"/>
+                </entity-find-one>
+                <else>
+                    <entity-find-one entity-name="moqui.device.DeviceConnection" value-field="connection">
+                        <field-map field-name="deviceId" from="deviceId"/>
+                    </entity-find-one>
+                </else>
+            </if>
+            <if condition="!connection">
+                <message error="true">Connection not found for device: ${deviceId}</message>
+                <check-errors/>
+            </if>
+
+            <set field="ctiPath" from="connection.transportConfig"/>
+            <if condition="!ctiPath">
+                <message error="true">Connection transportConfig must specify driver path.</message>
+                <check-errors/>
+            </if>
+
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
+
+                ExecutionContext ec = context.ec
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.servo.path", GenicamUtil.DEFAULT_SERVO_PATH)
+                String resolvedImageFormat = GenicamUtil.resolveImageFormat(ec, imageFormat)
+                Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.servo.resize.width")
+                Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.servo.resize.height")
+                Map<String, Object> pyResults = [:]
+
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
+                    pyResults = client.acquireVisualServoFrame(useCachedFrame as boolean,
+                            saveSnapshot as boolean, resolvedOutputDir, resolvedImageFormat,
+                            resolvedResizeWidth, resolvedResizeHeight)
+                } catch (Throwable t) {
+                    ec.logger.error("GenICam JEP visual servo frame acquisition failed", t)
+                    throw t
+                }
+
+                context.frameBytes = pyResults?.get("frame_bytes")
+                context.jpegBytes = pyResults?.get("jpeg_bytes")
+                context.contentType = pyResults?.get("content_type")
+                context.dataFormat = pyResults?.get("data_format")
+                context.frameFormat = pyResults?.get("extension")
+                context.componentIndex = pyResults?.get("component_index")
+                context.width = pyResults?.get("width")
+                context.height = pyResults?.get("height")
+                context.capturedAt = pyResults?.get("captured_at")
+                context.source = pyResults?.get("source")
+                context.snapshotLocation = pyResults?.get("snapshot_location")
+                context.previewLocation = pyResults?.get("preview_location")
             ]]></script>
         </actions>
     </service>
@@ -319,18 +400,15 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
 
             <set field="ctiPath" from="connection.transportConfig"/>
-            <set field="serialNumber" from="device.serialNumber ?: connection.connectionName"/>
-
-            <!-- Execute JEP GenICam Live MJPEG Streaming -->
             <script><![CDATA[
                 import org.moqui.context.ExecutionContext
-                import org.moqui.impl.tools.JepToolFactory
-                import jep.Interpreter
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
                 import jakarta.servlet.http.HttpServletResponse
                 import java.io.OutputStream
 
                 ExecutionContext ec = context.ec
-                final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
 
                 HttpServletResponse response = (HttpServletResponse) ec.web.response
                 response.setContentType("multipart/x-mixed-replace; boundary=frame")
@@ -340,43 +418,13 @@ along with this software (see the LICENSE.md file). If not, see
 
                 OutputStream os = response.getOutputStream()
 
-                try (Interpreter interpreter = tool.getInterpreter()) {
-                    URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
-                    String scriptDir = ""
-                    if (scriptUrl != null) {
-                        try {
-                            scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
-                        } catch (Throwable t) {
-                            scriptDir = scriptUrl.getPath()
-                            if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
-                            if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
-                        }
-                    }
-                    if (!scriptDir) {
-                        scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
-                        if (scriptDir.startsWith("file:")) {
-                            scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
-                        }
-                    }
-                    scriptDir = scriptDir.replace('\\', '/')
-                    
-                    interpreter.exec("import sys")
-                    interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
-                    interpreter.exec("import genicam_bridge")
-
-                    interpreter.set("cti_path", ctiPath)
-                    interpreter.set("serial_number", serialNumber)
-                    interpreter.set("device_id", deviceId)
-                    interpreter.set("ec", ec)
-
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
                     // stream 100 frames (~7 seconds) as a safety-net limit for testing, or until client disconnects
                     int maxFrames = 100
                     int frameCount = 0
                     
                     while (frameCount < maxFrames) {
-                        interpreter.exec("result = genicam_bridge.run_action('get_frame', cti_path, serial_number, ec=ec, device_id=device_id)")
-                        Map pyRes = (Map) interpreter.getValue("result")
-                        byte[] jpegBytes = (byte[]) pyRes?.get("jpeg_bytes")
+                        byte[] jpegBytes = client.getFrameBytes()
 
                         if (jpegBytes) {
                             try {
@@ -404,7 +452,7 @@ along with this software (see the LICENSE.md file). If not, see
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
-            <parameter name="outputDir" default-value="runtime/genicam/tensors"/>
+            <parameter name="outputDir"/>
         </in-parameters>
         <out-parameters>
             <parameter name="tensorId"/>
@@ -441,76 +489,29 @@ along with this software (see the LICENSE.md file). If not, see
                 <check-errors/>
             </if>
             
-            <set field="serialNumber" from="device.serialNumber"/>
-            <if condition="connection.options">
-                <script><![CDATA[
-                    Map optsMap = [:]
-                    connection.options.split(",")*.trim().each {
-                        def parts = it.split("=")
-                        if (parts.length == 2) optsMap.put(parts[0], parts[1])
-                    }
-                    if (optsMap.serial) serialNumber = optsMap.serial
-                ]]></script>
-            </if>
-            <if condition="!serialNumber">
-                <set field="serialNumber" from="connection.connectionName"/>
-            </if>
-
-            <!-- Get JEP tool factory -->
             <script><![CDATA[
                 import org.moqui.context.ExecutionContext
-                import org.moqui.impl.tools.JepToolFactory
-                import jep.Interpreter
-                import org.moqui.entity.EntityValue
-                import java.io.File
+                import org.moqui.genicam.GenicamClient
+                import org.moqui.genicam.GenicamUtil
 
                 ExecutionContext ec = context.ec
-                final JepToolFactory tool = ec.getTool("Jep", JepToolFactory.class)
+                String serialNumber = GenicamUtil.resolveSerialNumber(device, connection)
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.tensors.path", GenicamUtil.DEFAULT_TENSORS_PATH)
                 Map<String, Object> pyResults = [:]
-                
-                try (Interpreter interpreter = tool.getInterpreter()) {
-                    URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
-                    String scriptDir = ""
-                    if (scriptUrl != null) {
-                        try {
-                            scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
-                        } catch (Throwable t) {
-                            scriptDir = scriptUrl.getPath()
-                            if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
-                            if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
-                        }
-                    }
-                    if (!scriptDir) {
-                        scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
-                        if (scriptDir.startsWith("file:")) {
-                            scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
-                        }
-                    }
-                    scriptDir = scriptDir.replace('\\', '/')
-                    interpreter.exec("import sys")
-                    interpreter.exec("if '${scriptDir}' not in sys.path: sys.path.append('${scriptDir}')")
-                    
-                    interpreter.set("cti_path", ctiPath)
-                    interpreter.set("serial_number", serialNumber)
-                    interpreter.set("device_id", deviceId)
-                    interpreter.set("output_dir", outputDir)
-                    interpreter.set("ec", ec)
-                    interpreter.set("action", "acquire_3d_frame")
-                    
-                    ec.logger.info("Executing JEP GenICam acquire_3d_frame for camera ${serialNumber}")
-                    interpreter.exec("import genicam_bridge")
-                    interpreter.exec("result = genicam_bridge.run_action(action, cti_path, serial_number, ec=ec, device_id=device_id)")
-                    
-                    pyResults = (Map<String, Object>) interpreter.getValue("result")
+
+                try (GenicamClient client = new GenicamClient(ec, ctiPath, serialNumber, deviceId)) {
+                    pyResults = client.acquire3dFrame()
                 } catch (Throwable t) {
                     ec.logger.error("GenICam JEP 3D frame acquisition failed", t)
                     throw t
                 }
 
                 if (pyResults) {
-                    context.tensorId = pyResults.get("tensorId")
-                    context.tensorContentId = pyResults.get("tensorContentId")
-                    context.contentLocation = pyResults.get("contentLocation")
+                    Map<String, Object> storedTensor = GenicamUtil.storeTensorPayload(ec, serialNumber, pyResults, resolvedOutputDir)
+                    context.tensorId = storedTensor.get("tensorId")
+                    context.tensorContentId = storedTensor.get("tensorContentId")
+                    context.contentLocation = storedTensor.get("contentLocation")
                 }
             ]]></script>
         </actions>
@@ -519,7 +520,7 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="clean" noun="GenICamTensors" authenticate="false" transaction="ignore">
         <in-parameters>
             <parameter name="daysToKeep" type="Integer" default-value="30"/>
-            <parameter name="outputDir" default-value="runtime/genicam/tensors"/>
+            <parameter name="outputDir"/>
         </in-parameters>
         <actions>
             <set field="keepMillis" from="daysToKeep * 24 * 60 * 60 * 1000L"/>

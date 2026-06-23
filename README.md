@@ -78,7 +78,9 @@ flowchart TD
 | Service Name | Purpose | Key Attributes |
 | :--- | :--- | :--- |
 | `run#GenICamRequest` | Processes read/write commands (e.g. exposure, triggers) | `transaction="ignore"` |
+| `acquire#SingleImage` | Captures one frame and saves it to disk as `.jpg`, `.bin`, or `.npy` | `transaction="ignore"` |
 | `acquire#VideoStream` | Asynchronously captures a number of 2D/JPEG frames | `transaction="ignore"` |
+| `acquire#VideoFile` | Records a short `.avi` or `.mp4` video file from the camera | `transaction="ignore"` |
 | `stream#LiveMjpeg` | Pushes live MJPEG stream to web browsers via HTTP | `transaction="ignore"` |
 | `acquire#GenICam3DFrame` | Decodes a GenDC 3D frame and persists it as a DB Tensor | `transaction="ignore"` |
 | `clean#GenICamTensors` | Deletes old 3D tensor files and database records | `transaction="ignore"` |
@@ -89,6 +91,7 @@ flowchart TD
 
 *   [component.xml](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/component.xml): Declares dependencies on `moqui-math`, `moqui-device`, and `moqui-jep`.
 *   [build.gradle](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/build.gradle): Manages builds and testing libraries.
+*   [MoquiConf.xml](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/MoquiConf.xml): Defines default output paths, image format, video container/codec, and optional resize settings.
 *   [data/GenicamData.xml](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/data/GenicamData.xml): Defines the scheduled cleanup `ServiceJob`.
 *   [data/GenicamTestData.xml](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/data/GenicamTestData.xml): Contains test camera definitions, connection configurations, and test requests.
 *   [script/genicam_bridge.py](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/script/genicam_bridge.py): Core Python bridge code (connecting Harvesters, decoding GenDC, converting pixel formats, and handling transactional persistence).
@@ -110,3 +113,34 @@ To run the integration tests:
 
 > [!TIP]
 > To configure real hardware, update the `DeviceConnection` records in your database to point to your physical GenTL driver (e.g. `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\Spinnaker_GenTL_v140.cti` on Windows) and set your camera's real serial number in the connection options.
+
+For direct acquisition tests against a connected FLIR camera, the most useful services are:
+
+```text
+moqui.genicam.GenicamServices.acquire#SingleImage
+moqui.genicam.GenicamServices.acquire#VideoFile
+moqui.genicam.GenicamServices.acquire#VideoStream
+```
+
+Typical parameters:
+
+```text
+deviceId=FLIR_CAMERA_1
+connectionName=FlirCameraConnection
+outputDir=runtime/genicam/captured_images   # or runtime/genicam/videos
+numFrames=120
+fps=15.0
+```
+
+Default media configuration is resolved from `MoquiConf.xml`, with optional per-service overrides:
+
+```text
+genicam.images.path
+genicam.frames.path
+genicam.videos.path
+genicam.servo.path
+genicam.tensors.path
+genicam.image.format        # jpg, png, bmp
+genicam.video.container     # avi, mp4
+genicam.video.codec         # MJPG, XVID, mp4v
+```

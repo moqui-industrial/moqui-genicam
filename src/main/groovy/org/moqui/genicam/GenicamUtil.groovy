@@ -13,6 +13,7 @@
  */
 package org.moqui.genicam
 
+import groovy.json.JsonSlurper
 import java.io.File
 import java.math.BigDecimal
 import org.moqui.context.ExecutionContext
@@ -209,6 +210,45 @@ final class GenicamUtil {
         runtimeConfig.servo_max_frame_age_ms = resolveConfiguredLong(ec, null, "genicam.servo.max.frame.age.ms")
 
         return runtimeConfig.findAll { String key, Object entryValue -> entryValue != null }
+    }
+
+    static String resolvePythonExecutable(final ExecutionContext ec) {
+        String runtimePath = ec?.factory?.runtimePath ?: System.getProperty("moqui.runtime")
+        if (!runtimePath) throw new IllegalStateException("Could not resolve moqui runtime path for moqui-genicam.")
+        boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win")
+        File pythonExecutable = isWindows ?
+                new File(runtimePath, "python_venv/Scripts/python.exe") :
+                new File(runtimePath, "python_venv/bin/python")
+        if (!pythonExecutable.exists()) {
+            throw new IllegalStateException("Python executable not found for moqui-genicam at ${pythonExecutable.absolutePath}")
+        }
+        return pythonExecutable.absolutePath
+    }
+
+    static String resolveComponentScriptPath(final ExecutionContext ec, final String relativePath) {
+        URL scriptUrl = ec.resource.getLocationReference("component://moqui-genicam/script").getUrl()
+        String scriptDir = ""
+        if (scriptUrl != null) {
+            try {
+                scriptDir = new File(scriptUrl.toURI()).getAbsolutePath()
+            } catch (Throwable t) {
+                scriptDir = scriptUrl.getPath()
+                if (scriptDir && scriptDir.startsWith("file:")) scriptDir = scriptDir.substring(5)
+                if (scriptDir && scriptDir.startsWith("/") && scriptDir.length() > 2 && scriptDir.charAt(2) == ':') scriptDir = scriptDir.substring(1)
+            }
+        }
+        if (!scriptDir) {
+            scriptDir = ec.resource.getLocationReference("component://moqui-genicam/script").getLocation()
+            if (scriptDir.startsWith("file:")) {
+                scriptDir = scriptDir.substring(scriptDir.startsWith("file:///") ? 8 : (scriptDir.startsWith("file:/") ? 6 : 5))
+            }
+        }
+        return new File(scriptDir, relativePath).absolutePath
+    }
+
+    static Object parseJsonText(final String jsonText) {
+        if (!jsonText) return null
+        return new JsonSlurper().parseText(jsonText)
     }
 
     static Map<String, Object> storeTensorPayload(final ExecutionContext ec, final String serialNumber,

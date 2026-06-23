@@ -217,6 +217,32 @@ class GenicamServiceTests extends Specification {
             videoFile.length() > 0
     }
 
+    def "test acquire multi video file with external worker processes (mock fallback)"() {
+        when: "calling the acquire#MultiVideoFile service"
+            Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#MultiVideoFile")
+                .parameter("deviceIdList", ["FLIR_CAMERA_1", "FLIR_CAMERA_1"])
+                .parameter("numFrames", 4)
+                .parameter("fps", 5.0G)
+                .call()
+
+        then: "no errors are raised"
+            !ec.message.hasError()
+
+        and: "the aggregate result reports two successful worker processes"
+            res.captureResults != null
+            ((List) res.captureResults).size() == 2
+            res.successfulCount == 2
+            res.failedCount == 0
+
+        and: "each worker produced a valid video file"
+            ((List) res.captureResults).every { Map item ->
+                item.success == true &&
+                    item.result?.video_path &&
+                    new File(item.result.video_path as String).exists() &&
+                    new File(item.result.video_path as String).length() > 0
+            }
+    }
+
     def "test acquire visual servo frame (mock fallback)"() {
         when: "calling the acquire#VisualServoFrame service"
             Map res = ec.service.sync().name("moqui.genicam.GenicamServices.acquire#VisualServoFrame")

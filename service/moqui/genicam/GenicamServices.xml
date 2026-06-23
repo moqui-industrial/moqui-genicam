@@ -276,6 +276,89 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
 
+    <service verb="acquire" noun="MultiVideoFile" authenticate="false" transaction="ignore">
+        <in-parameters>
+            <parameter name="deviceIdList" type="List" required="true"/>
+            <parameter name="connectionNameList" type="List"/>
+            <parameter name="numFrames" type="Integer"/>
+            <parameter name="fps" type="BigDecimal"/>
+            <parameter name="outputDir"/>
+            <parameter name="videoContainer"/>
+            <parameter name="videoCodec"/>
+            <parameter name="resizeWidth" type="Integer"/>
+            <parameter name="resizeHeight" type="Integer"/>
+            <parameter name="processTimeoutMs" type="Long"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="captureResults" type="List"/>
+            <parameter name="successfulCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                import org.moqui.entity.EntityValue
+                import org.moqui.genicam.GenicamMultiCameraRunner
+                import org.moqui.genicam.GenicamUtil
+
+                ExecutionContext ec = context.ec
+                List<String> resolvedDeviceIdList = (deviceIdList ?: []) as List<String>
+                if (!resolvedDeviceIdList) throw new IllegalArgumentException("At least one deviceId is required.")
+
+                List<String> resolvedConnectionNameList = (connectionNameList ?: []) as List<String>
+                String resolvedOutputDir = GenicamUtil.resolveConfiguredPath(ec, outputDir,
+                        "genicam.videos.path", GenicamUtil.DEFAULT_VIDEOS_PATH)
+                Integer resolvedNumFrames = GenicamUtil.resolveConfiguredInteger(ec, numFrames, "genicam.videos.default.numFrames")
+                BigDecimal resolvedFps = GenicamUtil.resolveConfiguredBigDecimal(ec, fps, "genicam.videos.default.fps")
+                String resolvedVideoContainer = GenicamUtil.resolveVideoContainer(ec, videoContainer)
+                String resolvedVideoCodec = GenicamUtil.resolveVideoCodec(ec, videoCodec)
+                Integer resolvedResizeWidth = GenicamUtil.resolveConfiguredInteger(ec, resizeWidth, "genicam.videos.resize.width")
+                Integer resolvedResizeHeight = GenicamUtil.resolveConfiguredInteger(ec, resizeHeight, "genicam.videos.resize.height")
+                Long resolvedProcessTimeoutMs = GenicamUtil.resolveConfiguredLong(ec, processTimeoutMs,
+                        "genicam.multi.process.timeout.ms")
+
+                List<Map<String, Object>> cameraList = []
+                for (int idx = 0; idx < resolvedDeviceIdList.size(); idx++) {
+                    String currentDeviceId = resolvedDeviceIdList.get(idx)
+                    EntityValue device = ec.entity.find("moqui.device.Device").condition("deviceId", currentDeviceId).one()
+                    if (!device) throw new IllegalArgumentException("Device not found with ID: ${currentDeviceId}")
+
+                    String currentConnectionName = idx < resolvedConnectionNameList.size() ? resolvedConnectionNameList.get(idx) : null
+                    EntityValue connection = currentConnectionName ?
+                            ec.entity.find("moqui.device.DeviceConnection").condition("connectionName", currentConnectionName).one() :
+                            ec.entity.find("moqui.device.DeviceConnection").condition("deviceId", currentDeviceId).one()
+                    if (!connection) throw new IllegalArgumentException("Connection not found for device: ${currentDeviceId}")
+                    if (!connection.transportConfig) {
+                        throw new IllegalArgumentException("Connection transportConfig must specify driver path for device ${currentDeviceId}.")
+                    }
+
+                    cameraList.add([
+                            camera_index: idx,
+                            device_id: currentDeviceId,
+                            serial_number: GenicamUtil.resolveSerialNumber(device, connection),
+                            cti_path: connection.transportConfig
+                    ])
+                }
+
+                Map<String, Object> options = [
+                        output_dir: resolvedOutputDir,
+                        num_frames: resolvedNumFrames,
+                        fps: resolvedFps,
+                        video_container: resolvedVideoContainer,
+                        video_codec: resolvedVideoCodec,
+                        resize_width: resolvedResizeWidth,
+                        resize_height: resolvedResizeHeight,
+                        processTimeoutMs: resolvedProcessTimeoutMs
+                ]
+                Map<String, Object> pyResults = GenicamMultiCameraRunner.acquireMultiVideoFile(ec, cameraList, options)
+
+                context.captureResults = pyResults?.get("results")
+                context.successfulCount = pyResults?.get("successful_count")
+                context.failedCount = pyResults?.get("failed_count")
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="acquire" noun="VisualServoFrame" authenticate="false" transaction="ignore">
         <in-parameters>
             <parameter name="deviceId" required="true"/>

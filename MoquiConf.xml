@@ -16,6 +16,7 @@
     <default-property name="genicam.connection.retry.count" value="3"/>
     <default-property name="genicam.connection.retry.backoff.ms" value="1000"/>
     <default-property name="genicam.connection.fetch.timeout.ms" value="1000"/>
+    <default-property name="genicam.multi.process.timeout.ms" value="120000"/>
     <default-property name="genicam.stream.max.frames" value="100"/>
     <default-property name="genicam.stream.frame.delay.ms" value="66"/>
     <default-property name="genicam.stream.stop.timeout.ms" value="3000"/>

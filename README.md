@@ -83,6 +83,7 @@ flowchart TD
 | `acquire#SingleImage` | Captures one frame and saves it to disk as `.jpg`, `.bin`, or `.npy` | `transaction="ignore"` |
 | `acquire#VideoStream` | Asynchronously captures a number of 2D/JPEG frames | `transaction="ignore"` |
 | `acquire#VideoFile` | Records a short `.avi` or `.mp4` video file from the camera | `transaction="ignore"` |
+| `acquire#MultiVideoFile` | Coordinates multi-camera video captures using separate worker processes | `transaction="ignore"` |
 | `stream#LiveMjpeg` | Pushes live MJPEG stream to web browsers via HTTP | `transaction="ignore"` |
 | `acquire#GenICam3DFrame` | Decodes a GenDC 3D frame and persists it as a DB Tensor | `transaction="ignore"` |
 | `clean#GenICamTensors` | Deletes old 3D tensor files and database records | `transaction="ignore"` |
@@ -121,6 +122,7 @@ For direct acquisition tests against a connected FLIR camera, the most useful se
 ```text
 moqui.genicam.GenicamServices.acquire#SingleImage
 moqui.genicam.GenicamServices.acquire#VideoFile
+moqui.genicam.GenicamServices.acquire#MultiVideoFile
 moqui.genicam.GenicamServices.acquire#VideoStream
 ```
 
@@ -159,6 +161,7 @@ genicam.servo.default.useCachedFrame
 genicam.servo.default.saveSnapshot
 genicam.servo.buffer.source
 genicam.servo.max.frame.age.ms
+genicam.multi.process.timeout.ms
 ```
 
 ## Ubuntu And Container Notes
@@ -184,6 +187,30 @@ Example container concerns:
 - set timezone and locale explicitly
 - keep container CPU pinned when low-latency servo loops matter
 - if multiple cameras are needed, prefer multiple containers over many in-process threads
+```
+
+## Multi-Camera Coordinator
+
+`acquire#MultiVideoFile` is the explicit service-level coordinator for parallel multi-camera recording. The service resolves each `Device` and `DeviceConnection` in Moqui, then launches one external Python worker process per camera so that camera SDK state is isolated at the operating-system process level.
+
+Typical usage:
+
+```text
+deviceIdList=["CAMERA_A","CAMERA_B"]
+connectionNameList=["ConnA","ConnB"]    # optional
+numFrames=120
+fps=10.0
+outputDir=runtime/genicam/videos
+videoContainer=avi
+videoCodec=MJPG
+```
+
+Returned data:
+
+```text
+captureResults
+successfulCount
+failedCount
 ```
 
 ## Visual Servoing Pattern

@@ -1,5 +1,6 @@
 //! Pull one JPEG for each HTTP body poll. No ExecutionContext escapes its request thread.
 use crate::{client::decode_bridge_bytes, worker::WorkerPool};
+use moqui_core::web::{BlockingStreamSource, StreamCancellation};
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -21,15 +22,16 @@ pub struct Mjpeg {
 }
 
 impl Mjpeg {
-    pub fn frame(&self) -> std::io::Result<Vec<u8>> {
+    pub fn frame(&self, cancellation: &StreamCancellation) -> std::io::Result<Vec<u8>> {
         let response = self
             .pool
-            .exchange(
+            .exchange_cancellable(
                 self.camera.clone(),
                 &self.python,
                 &self.script,
                 &self.payload,
                 self.timeout,
+                Some(cancellation),
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         if let Some(error) = response.get("error") {
@@ -51,20 +53,29 @@ impl Mjpeg {
     }
 }
 
-impl Iterator for Mjpeg {
-    type Item = std::io::Result<Vec<u8>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ended {
+impl BlockingStreamSource for Mjpeg {
+    fn next_chunk(
+        &mut self,
+        cancellation: &StreamCancellation,
+    ) -> Option<std::io::Result<Vec<u8>>> {
+        if self.ended || cancellation.is_cancelled() {
             return None;
         }
         if self.remaining == Some(0) {
             self.ended = true;
             return Some(Ok(b"--moqui-frame--\r\n".to_vec()));
         }
-        if let Some(last) = self.last {
-            std::thread::sleep(self.delay.saturating_sub(last.elapsed()));
+        if let Some(last) = self.last
+            && cancellation.wait_timeout(self.delay.saturating_sub(last.elapsed()))
+        {
+            return None;
         }
-        let frame = match self.first.take().map(Ok).unwrap_or_else(|| self.frame()) {
+        let frame = match self
+            .first
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| self.frame(cancellation))
+        {
             Ok(frame) => frame,
             Err(error) => {
                 self.ended = true;

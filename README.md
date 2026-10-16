@@ -271,10 +271,9 @@ throughput are outside those regression tests.
 `moqui.genicam.GenicamServices.stream#LiveMjpeg` now streams JPEG parts
 progressively through MR-Moqui's native `web::ResponseStream`. Update/build
 MR-Moqui with this API before building this component. The extension is published
-in [moqui-industrial/mr-moqui, native-http-streaming](https://github.com/moqui-industrial/mr-moqui/tree/native-http-streaming)
-and proposed upstream in [MR-Moqui PR #18](https://github.com/moqui/mr-moqui/pull/18).
-Until that PR is merged, build the framework from that branch. The service
-requires an active HTTP request; a headless call returns an error.
+in [moqui-industrial/mr-moqui, generic-http-streaming](https://github.com/moqui-industrial/mr-moqui/tree/generic-http-streaming).
+Build the framework from that branch until the generic API is integrated upstream.
+The service requires an active HTTP request; a headless call returns an error.
 
 Mount `component://moqui-genicam/screen/GenicamStream.xml` as a subscreen in your
 application. For example, inside its existing `<subscreens>` declaration:
@@ -305,11 +304,17 @@ The first JPEG is acquired before the response starts, so initial camera errors
 return through normal service error handling. Later capture errors terminate
 the body. Frames use the persistent worker for the CTI/serial pair; different
 viewers of the same camera share that worker. Capture is requested as the HTTP
-body is consumed, with no unbounded frame queue. Disconnect drops the iterator
-after any in-flight capture/delay completes. Each IPC exchange has a 5-second
-response timeout; competing calls serialize on the shared camera worker.
-The delay is at most 60 seconds. Disconnect leaves the worker available to
-other calls; factory shutdown closes it and rejects subsequent acquisitions.
+body is consumed, with no unbounded frame queue. Disconnect signals cancellation
+to the producer. Delays are interruptible; camera lock
+waits and IPC reads check cancellation at short intervals and have a total
+5-second deadline. An interrupted in-flight capture retires its worker without
+replaying the command; subsequent calls can reopen that camera. Cancellation
+while waiting for a busy camera leaves the active caller's worker alone.
+Factory shutdown closes workers and rejects subsequent acquisitions.
+
+MJPEG uses a dedicated blocking-stream thread. The framework defaults to at
+most 16 blocking streams per process (`webapp_stream_blocking_max`); excess
+streams receive HTTP 503. Async streams do not consume those threads.
 A slow camera sets the achievable frame rate.
 
 The [HTTP test](test/mjpeg_http.py) checks progressive delivery, finite closure,

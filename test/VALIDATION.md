@@ -46,3 +46,23 @@ The authenticated MJPEG check also passed after rebasing the streaming extension
 onto MR-Moqui master `ed51656`. The required framework extension is published in
 [PR #18](https://github.com/moqui/mr-moqui/pull/18) and the
 [moqui-industrial framework branch](https://github.com/moqui-industrial/mr-moqui/tree/native-http-streaming).
+
+## Generic streaming API follow-up
+
+The video-motivated framework PR #18 was closed. Its successor is published in
+`moqui-industrial/mr-moqui`, branch `generic-http-streaming`, with an exclusively
+owned source, explicit cancellation, async sources and bounded dedicated blocking
+workers. The GenICam native service now uses the cancellation-aware blocking API.
+
+Four core stream tests and seven host stream tests passed. They cover binary
+chunks, cancellation of a pending upstream HTTP request after downstream
+disconnect, idle/in-flight worker cleanup, blocking admission limits, isolation
+from Tokio's shared blocking pool, and post-header transport/application errors.
+Four GenICam Rust tests passed, including termination and retirement of a Python
+worker during a cancelled acquisition without replay. Camera lock waits and IPC
+response reads now observe cancellation and a shared request deadline.
+
+The linked application build and core/host/component Clippy checks with warnings
+denied passed. Authenticated loopback MJPEG checks passed on the generic API:
+progressive frames, finite close, unlimited disconnect and subsequent capture.
+The three native ONNX features also passed with the new framework build.

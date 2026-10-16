@@ -44,3 +44,9 @@ Use the actual cookie name/value returned by your application. The test requests
 the explicit `FLIR_CAMERA_1` mock fixture, verifies progressive JPEG parts and
 finite closure, disconnects an unlimited stream, then captures again. It needs
 the MR-Moqui native response-stream extension. It creates no image snapshots.
+
+The generic framework streaming API requires the `generic-http-streaming` branch
+linked in the component README. Rust worker tests also verify cancellation during
+an in-flight Python acquisition; the worker is retired without replaying the
+command. HTTP blocking streams are limited by `webapp_stream_blocking_max`
+(default 16 per framework process).

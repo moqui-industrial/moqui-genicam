@@ -1,12 +1,13 @@
 //! A persistent JSON-lines bridge per camera. The factory owns worker lifetimes.
+use moqui_core::web::StreamCancellation;
 use moqui_lib::error::Error;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 type CameraKey = (String, String);
 #[derive(Default)]
@@ -21,6 +22,23 @@ impl WorkerPool {
         payload: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, Error> {
+        self.exchange_cancellable(key, python, script, payload, timeout, None)
+    }
+
+    pub fn exchange_cancellable(
+        &self,
+        key: CameraKey,
+        python: &Path,
+        script: &Path,
+        payload: &serde_json::Value,
+        timeout: Duration,
+        cancellation: Option<&StreamCancellation>,
+    ) -> Result<serde_json::Value, Error> {
+        let deadline = Instant::now() + timeout;
+        let cancelled = || cancellation.is_some_and(StreamCancellation::is_cancelled);
+        if cancelled() {
+            return Err(Error::new("GenICam capture cancelled"));
+        }
         let worker = {
             let mut workers = self
                 .0
@@ -37,10 +55,34 @@ impl WorkerPool {
             }
             workers[&key].clone()
         };
-        let mut bridge = worker
-            .lock()
-            .map_err(|_| Error::new("GenICam worker lock poisoned"))?;
-        let result = bridge.exchange(payload, timeout);
+        let mut bridge = loop {
+            if cancelled() {
+                return Err(Error::new(
+                    "GenICam capture cancelled while waiting for camera",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new("GenICam camera busy/timed out"));
+            }
+            match worker.try_lock() {
+                Ok(bridge) => break bridge,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(Error::new("GenICam worker lock poisoned"));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Some(cancellation) = cancellation {
+                        cancellation.wait_timeout(Duration::from_millis(10));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        };
+        let result = bridge.exchange(
+            payload,
+            deadline.saturating_duration_since(Instant::now()),
+            cancellation,
+        );
         if result.is_err() {
             // Do not replay writes/triggers after an uncertain failure.
             bridge.stop();
@@ -127,6 +169,7 @@ impl Worker {
         &mut self,
         payload: &serde_json::Value,
         timeout: Duration,
+        cancellation: Option<&StreamCancellation>,
     ) -> Result<serde_json::Value, Error> {
         serde_json::to_writer(&mut self.input, payload)
             .map_err(|e| Error::new(format!("worker request failed: {e}")))?;
@@ -134,11 +177,30 @@ impl Worker {
             .write_all(b"\n")
             .and_then(|_| self.input.flush())
             .map_err(|e| Error::new(format!("worker stdin failed: {e}")))?;
-        let response = self
-            .responses
-            .recv_timeout(timeout)
-            .map_err(|e| Error::new(format!("GenICam worker response failed/timed out: {e}")))?
-            .map_err(|e| Error::new(format!("worker stdout failed: {e}")))?;
+        let deadline = Instant::now() + timeout;
+        let response = loop {
+            if cancellation.is_some_and(StreamCancellation::is_cancelled) {
+                return Err(Error::new("GenICam capture cancelled during acquisition"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::new("GenICam worker response timed out"));
+            }
+            match self
+                .responses
+                .recv_timeout(remaining.min(Duration::from_millis(20)))
+            {
+                Ok(response) => {
+                    break response.map_err(|e| Error::new(format!("worker stdout failed: {e}")))?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(Error::new(format!(
+                        "GenICam worker response failed: {error}"
+                    )));
+                }
+            }
+        };
         serde_json::from_str(&response)
             .map_err(|e| Error::new(format!("Invalid GenICam worker JSON: {e}")))
     }
@@ -147,6 +209,7 @@ impl Worker {
         let _ = self.exchange(
             &serde_json::json!({"command":"close-all"}),
             Duration::from_secs(3),
+            None,
         );
         self.stop();
     }
@@ -191,6 +254,52 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_interrupts_acquisition_and_retires_the_worker() -> Result<(), Error> {
+        let prefix =
+            std::env::temp_dir().join(format!("moqui-genicam-cancel-{}", std::process::id()));
+        let script = prefix.with_extension("py");
+        let marker = prefix.with_extension("started");
+        std::fs::write(&script, format!("import sys, time, pathlib\nsys.stdin.readline()\npathlib.Path({:?}).write_text('one request')\ntime.sleep(30)\n", marker.to_string_lossy()))
+            .map_err(|e| Error::new(e.to_string()))?;
+        let pool = Arc::new(WorkerPool::default());
+        let worker_pool = pool.clone();
+        let cancellation = StreamCancellation::default();
+        let signal = cancellation.clone();
+        let worker_script = script.clone();
+        let (send, done) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = worker_pool.exchange_cancellable(
+                ("mock".into(), "cancel".into()),
+                Path::new("python3"),
+                &worker_script,
+                &serde_json::json!({"command":"run-action"}),
+                Duration::from_secs(30),
+                Some(&signal),
+            );
+            let _ = send.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cancellation.cancel();
+        let result = done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled acquisition must stop promptly");
+        thread.join().unwrap();
+        assert!(
+            marker.exists(),
+            "fixture must reach its blocking acquisition"
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(pool.0.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "one request");
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_file(marker).unwrap();
+        Ok(())
+    }
+
+    #[test]
     fn mock_camera_keeps_frame_cache_across_calls() -> Result<(), Error> {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("script/genicam_bridge.py");
         let pool = WorkerPool::default();
@@ -218,9 +327,23 @@ mod tests {
         assert!(second["frame_bytes"]["__base64__"].as_str().is_some());
         pool.close(&key);
         // Closing a single camera permits a later capture. Factory shutdown does not.
-        pool.exchange(key.clone(), Path::new("python3"), &script, &payload, Duration::from_secs(15))?;
+        pool.exchange(
+            key.clone(),
+            Path::new("python3"),
+            &script,
+            &payload,
+            Duration::from_secs(15),
+        )?;
         pool.close_all();
-        let error = pool.exchange(key, Path::new("python3"), &script, &payload, Duration::from_secs(15)).unwrap_err();
+        let error = pool
+            .exchange(
+                key,
+                Path::new("python3"),
+                &script,
+                &payload,
+                Duration::from_secs(15),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("shutting down"));
         assert!(pool.0.lock().unwrap().is_empty());
         Ok(())

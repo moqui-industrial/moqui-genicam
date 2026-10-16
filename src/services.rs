@@ -582,10 +582,11 @@ pub fn stream_live_mjpeg(
         last: None,
         ended: false,
     };
-    source.first = Some(source.frame().map_err(|e| LibError::new(e.to_string()))?);
+    let cancellation = moqui_core::web::StreamCancellation::default();
+    source.first = Some(source.frame(&cancellation).map_err(|e| LibError::new(e.to_string()))?);
     moqui_core::web::send_stream(
         "multipart/x-mixed-replace; boundary=moqui-frame",
-        moqui_core::web::ResponseStream::new(source),
+        moqui_core::web::ResponseStream::from_blocking(source, cancellation),
     )?;
     Ok(Parameters::new())
 }

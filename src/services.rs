@@ -15,8 +15,6 @@
 use std::fs;
 use std::path::Path;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use jiff::Timestamp;
 use moqui_core::context::ExecutionContext;
 use moqui_core::entity::EntityValue;
@@ -83,13 +81,17 @@ fn resolve_device_and_connection(
     };
 
     let connection = connection.ok_or_else(|| LibError::new(format!("Connection not found for device: {device_id}")))?;
+    if connection.get("deviceId").and_then(|v| v.as_str()) != Some(device_id) {
+        return Err(LibError::new("The selected GenICam connection belongs to another device"));
+    }
 
     let cti_path = connection.get("transportConfig").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
     if cti_path.is_empty() {
         return Err(LibError::new(format!("Connection transportConfig must specify driver path for device: {device_id}")));
     }
 
-    let serial_number = util::resolve_serial_number(Some(&device), Some(&connection));
+    let physical = entity.find("moqui.device.PhysicalDevice")?.eq("deviceId", Value::string(device_id)).one()?;
+    let serial_number = util::resolve_serial_number(physical.as_ref().or(Some(&device)), Some(&connection));
     Ok((device, connection, cti_path, serial_number))
 }
 
@@ -138,7 +140,11 @@ pub fn run_genicam_request(
         Some(Value::Object(obj)) => obj.downcast::<EntityValue>(),
         _ => None,
     };
-    let serial_number = util::resolve_serial_number(device.as_deref(), Some(&connection));
+    if connection.get("deviceId").and_then(Value::as_str) != Some(device_id) {
+        return Err(LibError::new("The selected GenICam connection belongs to another device"));
+    }
+    let physical = entity.find("moqui.device.PhysicalDevice")?.eq("deviceId", Value::string(device_id)).one()?;
+    let serial_number = util::resolve_serial_number(physical.as_ref().or(device.as_deref()), Some(&connection));
 
     tracing::info!("Connecting to camera with ID {device_id} using CTI {cti_path}");
     let client = GenicamClient::new(cti_path, serial_number, Some(device_id.to_string()));
@@ -183,7 +189,7 @@ pub fn acquire_single_image(
     )?;
     let resolved_fmt = util::resolve_image_format(image_format.as_deref())?;
 
-    let client = GenicamClient::new(cti_path, serial_number, Some(device_id));
+    let client = GenicamClient::new(cti_path, serial_number, Some(device_id.clone()));
     let py_results = client.acquire_single_image(
         ec,
         Some(&resolved_out_dir.to_string_lossy()),
@@ -196,6 +202,7 @@ pub fn acquire_single_image(
     if let Some(map) = py_results.as_object() {
         if let Some(val) = map.get("file_path").and_then(|v| v.as_str()) {
             out.insert("imageLocation".to_string(), Value::string(val));
+            out.insert("deviceContentId".into(), Value::string(util::store_image_content(ec, &device_id, val)?));
         }
         if let Some(val) = map.get("extension").and_then(|v| v.as_str()) {
             out.insert("imageFormat".to_string(), Value::string(val));
@@ -246,7 +253,7 @@ pub fn acquire_video_stream(
     )?;
     let resolved_fmt = util::resolve_image_format(image_format.as_deref())?;
 
-    let client = GenicamClient::new(cti_path, serial_number, Some(device_id));
+    let client = GenicamClient::new(cti_path, serial_number, Some(device_id.clone()));
     let py_results = client.acquire_video_stream(
         ec,
         num_frames,
@@ -259,6 +266,13 @@ pub fn acquire_video_stream(
     let mut out = Parameters::new();
     if let Some(map) = py_results.as_object() {
         if let Some(arr) = map.get("acquired_frames") {
+            let mut ids = Vec::new();
+            if let Some(frames) = arr.as_array() {
+                for location in frames.iter().filter_map(|value| value.as_str()) {
+                    ids.push(Value::string(util::store_image_content(ec, &device_id, location)?));
+                }
+            }
+            out.insert("deviceContentIdList".into(), Value::List(ids));
             out.insert("acquiredFrames".to_string(), json_to_moqui_value(arr).map_err(|e| LibError::new(e.to_string()))?);
         }
         if let Some(arr) = map.get("device_content_id_list") {
@@ -303,7 +317,7 @@ pub fn acquire_video_file(
     let resolved_container = util::resolve_video_container(video_container.as_deref())?;
     let resolved_codec = util::resolve_video_codec(video_codec.as_deref())?;
 
-    let client = GenicamClient::new(cti_path, serial_number, Some(device_id));
+    let client = GenicamClient::new(cti_path, serial_number, Some(device_id.clone()));
     let py_results = client.acquire_video_file(
         ec,
         num_frames,
@@ -429,6 +443,15 @@ pub fn acquire_multi_video_file(
     Ok(out)
 }
 
+fn frame_timestamp(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+
 pub fn acquire_visual_servo_frame(
     ec: &ExecutionContext,
     _info: &ServiceInfo<'_>,
@@ -461,7 +484,7 @@ pub fn acquire_visual_servo_frame(
     )?;
     let resolved_fmt = util::resolve_image_format(image_format.as_deref())?;
 
-    let client = GenicamClient::new(cti_path, serial_number, Some(device_id));
+    let client = GenicamClient::new(cti_path, serial_number, Some(device_id.clone()));
     let py_results = client.acquire_visual_servo_frame(
         ec,
         use_cached,
@@ -474,15 +497,11 @@ pub fn acquire_visual_servo_frame(
 
     let mut out = Parameters::new();
     if let Some(map) = py_results.as_object() {
-        if let Some(b64) = map.get("frame_bytes").and_then(|v| v.as_str()) {
-            if let Ok(bytes) = BASE64.decode(b64) {
-                out.insert("frameBytes".to_string(), Value::Bytes(bytes));
-            }
+        if let Some(buffer) = map.get("frame_bytes").filter(|value| !value.is_null()) {
+            out.insert("frameBytes".to_string(), Value::Bytes(crate::client::decode_bridge_bytes(buffer)?));
         }
-        if let Some(b64) = map.get("jpeg_bytes").and_then(|v| v.as_str()) {
-            if let Ok(bytes) = BASE64.decode(b64) {
-                out.insert("jpegBytes".to_string(), Value::Bytes(bytes));
-            }
+        if let Some(buffer) = map.get("jpeg_bytes").filter(|value| !value.is_null()) {
+            out.insert("jpegBytes".to_string(), Value::Bytes(crate::client::decode_bridge_bytes(buffer)?));
         }
         if let Some(val) = map.get("content_type").and_then(|v| v.as_str()) {
             out.insert("contentType".to_string(), Value::string(val));
@@ -502,7 +521,9 @@ pub fn acquire_visual_servo_frame(
         if let Some(val) = map.get("height").and_then(|v| v.as_i64()) {
             out.insert("height".to_string(), Value::I64(val));
         }
-        if let Some(val) = map.get("captured_at").and_then(|v| v.as_str()) {
+        // The bridge emits time.time() (Unix seconds), not a JSON string.
+        // Keep the service's string representation compatible with adapters.
+        if let Some(val) = map.get("captured_at").and_then(frame_timestamp) {
             out.insert("capturedAt".to_string(), Value::string(val));
         }
         if let Some(val) = map.get("source").and_then(|v| v.as_str()) {
@@ -510,9 +531,11 @@ pub fn acquire_visual_servo_frame(
         }
         if let Some(val) = map.get("snapshot_location").and_then(|v| v.as_str()) {
             out.insert("snapshotLocation".to_string(), Value::string(val));
+            out.insert("snapshotDeviceContentId".into(), Value::string(util::store_image_content(ec, &device_id, val)?));
         }
         if let Some(val) = map.get("preview_location").and_then(|v| v.as_str()) {
             out.insert("previewLocation".to_string(), Value::string(val));
+            out.insert("previewDeviceContentId".into(), Value::string(util::store_image_content(ec, &device_id, val)?));
         }
         if let Some(val) = map.get("snapshot_device_content_id").and_then(|v| v.as_str()) {
             out.insert("snapshotDeviceContentId".to_string(), Value::string(val));
@@ -546,7 +569,7 @@ pub fn acquire_genicam_3d_frame(
     let (_device, _conn, cti_path, serial_number) =
         resolve_device_and_connection(ec, &device_id, connection_name.as_deref())?;
 
-    let client = GenicamClient::new(cti_path, serial_number.clone(), Some(device_id));
+    let client = GenicamClient::new(cti_path, serial_number.clone(), Some(device_id.clone()));
     let py_results = client.acquire_3d_frame(ec)?;
 
     let (tensor_id, tensor_content_id, content_location) =
@@ -566,59 +589,54 @@ pub fn clean_genicam_tensors(
     parameters: &Parameters,
 ) -> Result<Parameters, LibError> {
     let days_to_keep = get_i64(parameters, "daysToKeep").unwrap_or(30);
-    let keep_millis = days_to_keep * 24 * 60 * 60 * 1000;
-    let threshold_millis = Timestamp::now().as_millisecond() - keep_millis;
-    let threshold_date = Timestamp::from_millisecond(threshold_millis)
-        .map_err(|e| LibError::new(format!("Timestamp error: {e}")))?;
-
-    tracing::info!("Cleaning up GenICam ToF tensors older than {:?} (daysToKeep={})", threshold_date, days_to_keep);
-
+    if days_to_keep <= 0 { return Err(LibError::new("daysToKeep must be positive")); }
+    let keep_millis = days_to_keep.checked_mul(86_400_000).ok_or_else(|| LibError::new("daysToKeep overflows retention interval"))?;
+    let threshold_millis = Timestamp::now().as_millisecond().checked_sub(keep_millis).ok_or_else(|| LibError::new("Invalid retention interval"))?;
+    let threshold_date = Timestamp::from_millisecond(threshold_millis).map_err(|e| LibError::new(e.to_string()))?;
+    let root = util::resolve_configured_path(ec, None, "genicam.tensors.path", util::DEFAULT_TENSORS_PATH)?;
     let entity = util::get_entity(ec)?;
-
-    let old_contents = entity.find("moqui.math.TensorContent")?
-        .eq("contentTypeEnumId", Value::string("TCntNpy"))
-        .list()?;
-
     let mut deleted_count: i64 = 0;
-    for content in old_contents.iter() {
-        let content_date = content.get("contentDate");
-        let should_delete = match content_date {
-            Some(Value::Timestamp(ts)) => ts < &threshold_date,
-            _ => false,
-        };
-
-        if !should_delete {
-            continue;
+    if root.exists() {
+        let root = fs::canonicalize(root).map_err(|e| LibError::new(e.to_string()))?;
+        let old_contents = entity.find("moqui.math.TensorContent")?.eq("contentTypeEnumId", Value::string("TCntNpy")).list()?;
+        for content in old_contents.iter() {
+            if !matches!(content.get("contentDate"), Some(Value::Timestamp(date)) if date < &threshold_date) { continue; }
+            let Some(tensor_id) = content.get("tensorId").and_then(Value::as_str) else { continue; };
+            let Some(tensor) = entity.find("moqui.math.Tensor")?.eq("tensorId", Value::string(tensor_id)).one()? else { continue; };
+            if !tensor.get("name").and_then(Value::as_str).is_some_and(|name| name.starts_with("GenICam 3D Frame - Camera ")) { continue; }
+            let Some(location) = content.get("contentLocation").and_then(Value::as_str) else { continue; };
+            let path = Path::new(location);
+            // Resolve symlinks before deletion. Content from other components/roots is untouched.
+            if !path.exists() { continue; }
+            let path = fs::canonicalize(path).map_err(|e| LibError::new(e.to_string()))?;
+            if !path.starts_with(&root) { continue; }
+            fs::remove_file(path).map_err(|e| LibError::new(format!("Cannot remove expired GenICam tensor: {e}")))?;
+            content.delete(&entity)?;
+            // Keep tensor/axis metadata: other models may still reference them.
+            deleted_count += 1;
         }
-
-        if let Some(loc) = content.get("contentLocation").and_then(|v| v.as_str()) {
-            let path = Path::new(loc);
-            if path.exists() {
-                let _ = fs::remove_file(path);
-                tracing::info!("Deleted old tensor file: {loc}");
-            }
-        }
-
-        let tensor_id = content.get("tensorId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-
-        let _ = content.delete(&entity);
-
-        if !tensor_id.is_empty() {
-            if let Ok(axes) = entity.find("moqui.math.TensorAxis")?.eq("tensorId", Value::string(&tensor_id)).list() {
-                for axis in axes.iter() {
-                    let _ = axis.delete(&entity);
-                }
-            }
-            if let Ok(Some(tensor)) = entity.find("moqui.math.Tensor")?.eq("tensorId", Value::string(&tensor_id)).one() {
-                let _ = tensor.delete(&entity);
-            }
-        }
-
-        deleted_count += 1;
     }
 
     tracing::info!("Successfully cleaned up {deleted_count} old ToF tensors.");
     let mut out = Parameters::new();
     out.insert("deletedCount".to_string(), Value::I64(deleted_count));
     Ok(out)
+}
+
+#[cfg(test)]
+mod frame_metadata_tests {
+    use super::frame_timestamp;
+
+    #[test]
+    fn retains_numeric_bridge_timestamp_and_legacy_strings() {
+        assert_eq!(
+            frame_timestamp(&serde_json::json!(1_792_152_000.25)),
+            Some("1792152000.25".into())
+        );
+        assert_eq!(
+            frame_timestamp(&serde_json::json!("2026-10-16T12:00:00Z")),
+            Some("2026-10-16T12:00:00Z".into())
+        );
+        assert_eq!(frame_timestamp(&serde_json::Value::Null), None);
+    }
 }

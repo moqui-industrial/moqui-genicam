@@ -1,8 +1,8 @@
 # moqui-genicam
 
-`moqui-genicam` is a **model-first** and **data-driven** integration component for the Modern Rust Moqui Framework (`mr-moqui`). It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via high-performance native Rust services, QuickJS tool integration, and the Python **Harvesters** library.
+`moqui-genicam` is a **model-first** and **data-driven** integration component for the Modern Rust Moqui Framework (`mr-moqui`). It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via native Rust services, QuickJS tool integration, and the Python **Harvesters** library.
 
-In `mr-moqui`, `moqui-genicam` replaces legacy Java Embedded Python (JEP) with a modern native Rust driver and CLI IPC architecture. Python code runs safely in isolated subprocesses using the camera SDKs while Moqui handles entities, transactions, and services natively in Rust and JavaScript.
+In `mr-moqui`, `moqui-genicam` replaces legacy Java Embedded Python (JEP) with a modern native Rust driver and CLI IPC architecture. Python code runs in camera-specific worker subprocesses using the camera SDKs while Moqui handles entities, transactions, and services natively in Rust and JavaScript.
 
 ---
 
@@ -11,7 +11,7 @@ In `mr-moqui`, `moqui-genicam` replaces legacy Java Embedded Python (JEP) with a
 Unlike typical IP camera streams (e.g. RTSP/ONVIF) or standard wrapper libraries that treat vision cameras as simple video feeds, `moqui-genicam` is designed from the ground up for **industrial automation** and **advanced machine vision**:
 
 1. **Model-First Digital Twin**: The camera's settings, capabilities, and registers are not hardcoded. They are declared in Moqui's database using the `moqui-device` and `moqui-math` schemas (see the component `data` and `entity` folders). Changes to exposure, triggers, or frame rates require zero code modifications.
-2. **Zero-Copy & Zero Graphics Pipelines**: Raw image buffers and Time-of-Flight (ToF) coordinate maps are processed directly in memory. They bypass traditional graphics conversions, converting buffers straight into structured NumPy arrays (no unnecessary BGR conversions) and saving them as `.npy` binaries.
+2. **Raw Buffer Processing**: Raw image buffers and Time-of-Flight (ToF) coordinate maps are processed directly in memory. Spatial buffers are decoded into NumPy arrays and saved as `.npy` files. Rust/Python IPC currently uses JSON with base64 buffers and therefore copies data; it is not a zero-copy transport.
 3. **Rust & QuickJS Native Architecture**: Combines the performance and memory safety of `mr-moqui` (Rust core and embedded Postgres/SQL) with the scientific Python stack (NumPy, OpenCV, Harvesters) through a fast, robust native IPC bridge.
 4. **Declarative XML Services**: Operations are organized via standard Moqui XML definitions with native Rust service bindings (`type="rust"`). Database transactions, file cleanups, and camera status changes are executed declaratively with standard validation and logging.
 
@@ -42,19 +42,19 @@ When a 3D frame is captured, `moqui-genicam` integrates the frame directly into 
   * Axis 1: Width (`TapWidth` / `X`)
   * Axis 2: Channels (`TapChannel` / `C` - coordinates $A, B, C$)
 * **Content Record**: Creates a `moqui.math.TensorContent` record pointing to the `.npy` file location on disk.
-* **Consistency Guarantee**: Database entries and disk writes are bound to consistent entity operations. If any step fails, records and artifacts are cleaned up cleanly.
+* **Persistence boundary**: Rust persists Tensor/Axis/Content and DeviceContent records in Moqui; the Python worker has no ExecutionContext. Filesystem writes are not transactional with the database. Operators must reconcile files after a failed persistence operation.
 
 ### 3. Resilient Fail-Safe & Status Transitions
 To protect industrial workflows, camera connection and acquisition errors trigger automatic state changes:
 * **Error Interception**: If a camera times out, disconnects, or fails to initialize, the Rust client intercepts the failure.
-* **State Transition**: The `moqui.device.Device` record status is automatically transitioned to `DbsErrorStop` via the Moqui Entity Facade.
+* **State Transition**: The `moqui.device.Device` record status is automatically transitioned to `DbsErrorStop` through the Moqui entity-auto update service, subject to the configured status flow and permissions.
 * **Backoff Retry**: Persistent connection attempts are retried up to 3 times with exponential backoff (1s, 2s, 4s) before declaring a hardware failure.
 
 ### 4. Scheduled Tensor Maintenance (Daily ServiceJob)
 High-frame-rate 3D cameras generate massive amounts of data. `moqui-genicam` includes a background cleanup engine to prevent disk space exhaustion:
 * **Daily Cron Job**: A scheduled job named `clean_GenICamTensors_daily` runs every day at 02:00 AM (`0 0 2 * * ?`).
 * **Declarative Service**: Invokes the `clean#GenICamTensors` native Rust service.
-* **Safe Deletion Loop**: Locates all `TCntNpy` tensors older than the configured threshold (default: 30 days), deletes their physical `.npy` files, and clears matching `Tensor`, `TensorAxis`, and `TensorContent` DB entries.
+* **Scoped retention**: Removes expired NPY files only for GenICam-named tensors under the configured `genicam.tensors.path`, checking canonical paths before deletion. It removes the matching TensorContent and keeps Tensor/Axis metadata because other models may reference them. Foreign tensors and custom output roots are skipped. `daysToKeep` must be positive. Filesystem deletion and database changes are not one atomic transaction.
 
 ---
 
@@ -80,10 +80,10 @@ flowchart TD
 | :--- | :--- | :--- |
 | `run#GenICamRequest` | Processes read/write commands (e.g. exposure, triggers) | `type="rust"` |
 | `acquire#SingleImage` | Captures one frame and saves it to disk as `.jpg`, `.png`, or `.bmp` | `type="rust"` |
-| `acquire#VideoStream` | Asynchronously captures a number of 2D/JPEG frames | `type="rust"` |
+| `acquire#VideoStream` | Captures a finite number of 2D/JPEG frames | `type="rust"` |
 | `acquire#VideoFile` | Records a short `.avi` or `.mp4` video file from the camera | `type="rust"` |
 | `acquire#MultiVideoFile` | Coordinates multi-camera video captures using separate worker processes | `type="rust"` |
-| `stream#LiveMjpeg` | Pushes live MJPEG stream to web clients | `type="rust"` |
+| `stream#LiveMjpeg` | Currently returns an explicit unsupported error in the headless Rust service | `type="rust"` |
 | `acquire#GenICam3DFrame` | Decodes a GenDC 3D frame and persists it as a DB Tensor | `type="rust"` |
 | `clean#GenICamTensors` | Deletes old 3D tensor files and database records | `type="rust"` |
 
@@ -96,7 +96,8 @@ flowchart TD
 *   `MoquiConf.xml`: Defines default output paths, image format, video container/codec, resize settings, and registers `GenicamClientFactory` tool.
 *   `src/lib.rs`: Rust component registration (`submit_component!`) and service catalogue.
 *   `src/client.rs`: `GenicamClient` struct, tool factory, and JavaScript Tool implementation.
-*   `src/services.rs`: High-performance native Rust service endpoints.
+*   `src/services.rs`: Native Rust service endpoints.
+*   `src/worker.rs`: Persistent per-camera JSON-lines workers, deadlines and shutdown.
 *   `src/util.rs`: Path resolutions, parameter synchronization, and tensor persistence.
 *   `src/multi_runner.rs`: Parallel multi-camera runner.
 *   `data/GenicamData.xml`: Defines the scheduled cleanup `ServiceJob`.
@@ -109,6 +110,10 @@ flowchart TD
 ---
 
 ## 🚀 Building & Testing in `mr-moqui`
+
+Install the `mr-moqui` branches of moqui-math, moqui-device and this component
+under MR-Moqui master's `runtime/component`, then run commands from the framework
+root. Mantle is not required for normal use or for this component's own camera tests.
 
 ### 1. Build the Application
 ```bash
@@ -176,6 +181,7 @@ genicam.servo.default.saveSnapshot
 genicam.servo.buffer.source
 genicam.servo.max.frame.age.ms
 genicam.multi.process.timeout.ms
+genicam.process.timeout.ms
 ```
 
 ---
@@ -199,6 +205,18 @@ videoCodec=MJPG
 
 ## Visual Servoing Pattern
 
+`acquire#VisualServoFrame` returns `capturedAt` as a string of Unix seconds
+(including fractional seconds), preserved from the Python bridge's `time.time()`.
+Consumers must parse it before applying their frame-age budget. Adapters may also
+return a timestamp string; preserve the timestamp's timezone when converting it.
+The service acquires frames; obstacle detection and camera-to-robot calibration
+are separate application stages.
+
+An optional [Rust ONNX trajectory example](https://github.com/moqui/moqui-device/tree/mr-moqui/examples/onnx-obstacle)
+in moqui-device replays a simulated calibrated obstacle after a frame, runs a
+real ONNX neural network, and checks the changed path. It runs independently of
+camera hardware and does not dispatch motion to a controller.
+
 Recommended loop:
 ```text
 1. Start streaming/caching for the camera.
@@ -217,3 +235,44 @@ Practical buffering pattern:
 - latency control: cap camera fetch timeout and consumer cycle time
 - fallback: if cache is stale, reacquire with useCachedFrame=false
 ```
+
+
+## Worker lifecycle, simulation and regression tests
+
+Rust keeps one Python JSON-lines worker per CTI/serial pair within the Moqui tool
+factory. Consecutive calls share the camera connection, latest-frame cache and
+streaming thread. `GenicamClient.close()` closes that camera's worker; factory
+shutdown closes all workers. Calls to different cameras use separate worker locks.
+The worker returns binary fields as `{"__base64__":"..."}`; native services decode
+them to Moqui byte buffers. Resizing/re-encoding preserves the capture timestamp.
+
+`genicam.process.timeout.ms` bounds a request (default 120000 ms). On an IPC error
+or timeout the worker is terminated and removed; writes/triggers are never
+automatically replayed after an uncertain outcome. A later call can create a new
+worker. Multi-camera captures have a separate coordinator and per-worker timeout.
+
+Simulation must be explicit: use CTI `mock`, the test camera `FLIR_CAMERA_1`, or
+a serial containing `mock`. Missing Harvesters or a missing real CTI driver
+produces an error; it no longer silently produces simulated observations.
+`DeviceConnection.options` supplies `serial=...`; physical serial numbers belong
+to `PhysicalDevice`, not `Device`. A named connection must belong to the requested
+camera.
+
+The [component regression tests](test/README.md) exercise real Rust services
+against the Python mock camera, including image buffers and DeviceContent, 3D
+Tensor/NPY persistence, connection ownership and retention isolation. See [the validation record](test/VALIDATION.md) for executed checks.
+No physical
+camera commissioning or measured servo-loop latency is claimed.
+
+## Native ONNX trajectory integration
+
+`moqui.device.TrajectoryPlannerServices.run#RobotArmTrajectoryPlanner` is an
+invocable Moqui service. With the optional `moqui-device/onnx` feature it loads
+the registered ONNX model and runs inference inside MR-Moqui through `ort` and
+ONNX Runtime; an HTTP provider is not required. The [isolated example](https://github.com/moqui/moqui-device/tree/mr-moqui/examples/onnx-obstacle)
+includes the native call and an optional remote-provider mode.
+
+GenICam supplies frames and timestamps. A detector and camera-to-robot calibration
+must supply an obstacle observation before requesting a new trajectory from the
+current TCP pose. The example simulates that stage and validates a narrow point
+path; it is not a commissioned robot collision avoidance system.

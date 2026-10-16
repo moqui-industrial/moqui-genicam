@@ -12,8 +12,6 @@
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -68,44 +66,13 @@ impl GenicamClient {
         }
         payload.insert("runtime_config".to_string(), runtime_config);
 
-        let input_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| LibError::new(format!("Failed to serialize GenICam bridge payload: {e}")))?;
-
-        let mut child = Command::new(&python_exe)
-            .arg(&script_path)
-            .arg("run-action")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| LibError::new(format!("Failed to spawn GenICam Python bridge at {}: {e}", python_exe.display())))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&input_bytes);
-            let _ = stdin.flush();
-        }
-
-        let output = child.wait_with_output()
-            .map_err(|e| LibError::new(format!("Failed to wait for GenICam Python bridge: {e}")))?;
-
-        let stdout_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-        if !output.status.success() {
-            self.mark_device_error(ec);
-            return Err(LibError::new(format!(
-                "GenICam bridge action '{}' failed (exit code {:?}): {stderr_text} stdout: {stdout_text}",
-                action,
-                output.status.code()
-            )));
-        }
-
-        if stdout_text.is_empty() {
-            return Ok(serde_json::Value::Null);
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(&stdout_text)
-            .map_err(|e| LibError::new(format!("Failed to parse GenICam bridge output JSON: {e}. Output was: {stdout_text}")))?;
+        let factory = ec.factory().get_tool_factory_typed::<GenicamToolFactory>("GenicamClient")
+            .ok_or_else(|| LibError::new("GenicamClient tool factory is not configured"))?;
+        let timeout_ms = util::resolve_config_property("genicam.process.timeout.ms", None)
+            .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0).unwrap_or(120_000);
+        let parsed = factory.workers.exchange((self.cti_path.clone(), self.serial_number.clone()),
+            &python_exe, &script_path, &serde_json::Value::Object(payload), std::time::Duration::from_millis(timeout_ms))
+            .inspect_err(|_| self.mark_device_error(ec))?;
 
         if let Some(err_val) = parsed.get("error") {
             self.mark_device_error(ec);
@@ -116,15 +83,18 @@ impl GenicamClient {
     }
 
     pub fn mark_device_error(&self, ec: &ExecutionContext) {
-        if let Some(did) = &self.device_id {
-            if let Ok(entity) = util::get_entity(ec) {
-                if let Ok(Some(dev)) = entity.find("moqui.device.Device").and_then(|f| f.eq("deviceId", Value::string(did)).one()) {
-                    let mut updated = dev.clone();
-                    updated.set("deviceStatusEnumId", Value::string("DbsErrorStop"));
-                    let _ = updated.update(&entity);
+        if let Some(did) = &self.device_id
+            && let Ok(entity) = util::get_entity(ec)
+                && let Ok(Some(dev)) = entity.find("moqui.device.Device").and_then(|f| f.eq("deviceId", Value::string(did)).one()) {
+                    let parameters = std::collections::BTreeMap::from([
+                        ("deviceId".into(), Value::string(did)),
+                        ("statusId".into(), Value::string("DbsErrorStop")),
+                    ]);
+                    let _ = dev;
+                    if let Err(error) = moqui_core::service::sync("update#moqui.device.Device", &parameters) {
+                        tracing::warn!("Could not record GenICam device error status: {error}");
+                    }
                 }
-            }
-        }
     }
 
     pub fn read(&self, ec: &ExecutionContext, request: &EntityValue, request_items: &[Value]) -> Result<(), LibError> {
@@ -234,6 +204,7 @@ impl GenicamClient {
         self.run_action(ec, "video", None, Some(&serde_json::Value::Object(map)))
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing JavaScript tool signature.
     pub fn acquire_video_file(
         &self,
         ec: &ExecutionContext,
@@ -277,6 +248,7 @@ impl GenicamClient {
             return BASE64.decode(base64_str).map_err(|e| LibError::new(format!("Base64 decode error: {e}")));
         }
         if let Some(jpeg_val) = res.get("jpeg_bytes") {
+            if jpeg_val.get("__base64__").is_some() { return decode_bridge_bytes(jpeg_val); }
             if let Some(b64) = jpeg_val.as_str() {
                 return BASE64.decode(b64).map_err(|e| LibError::new(format!("Base64 decode error: {e}")));
             }
@@ -291,6 +263,7 @@ impl GenicamClient {
         self.run_action(ec, "get_frame_payload", None, None)
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing JavaScript tool signature.
     pub fn acquire_visual_servo_frame(
         &self,
         ec: &ExecutionContext,
@@ -321,38 +294,22 @@ impl GenicamClient {
     }
 
     pub fn close(&self, ec: &ExecutionContext) -> Result<(), LibError> {
-        let python_exe = util::resolve_python_executable(ec)?;
-        let script_path = util::resolve_component_script_path(ec, "genicam_bridge.py")?;
-
-        let mut payload = serde_json::Map::new();
-        payload.insert("command".to_string(), serde_json::Value::from("close-all"));
-        let input_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-
-        let mut child = Command::new(&python_exe)
-            .arg(&script_path)
-            .arg("close-all")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| LibError::new(format!("Failed to spawn Python close-all: {e}")))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&input_bytes);
-            let _ = stdin.flush();
+        if let Some(factory) = ec.factory().get_tool_factory_typed::<GenicamToolFactory>("GenicamClient") {
+            factory.workers.close(&(self.cti_path.clone(), self.serial_number.clone()));
         }
-        let _ = child.wait();
         Ok(())
     }
 }
 
 #[derive(Default)]
-pub struct GenicamToolFactory;
+pub struct GenicamToolFactory { pub(crate) workers: crate::worker::WorkerPool }
 
 impl ToolFactory for GenicamToolFactory {
     fn name(&self) -> &str {
         "GenicamClient"
     }
+
+    fn destroy(&self) { self.workers.close_all(); }
 
     fn get_instance(&self, parameters: &[Value]) -> Result<Arc<dyn Tool>, CoreError> {
         let cti_path = parameters.first()
@@ -573,6 +530,9 @@ impl Tool for GenicamTool {
 }
 
 pub fn json_to_moqui_value(val: &serde_json::Value) -> Result<Value, CoreError> {
+    if val.get("__base64__").is_some() {
+        return decode_bridge_bytes(val).map(Value::Bytes).map_err(|error| CoreError::new(error.to_string()));
+    }
     match val {
         serde_json::Value::Null => Ok(Value::Null),
         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
@@ -601,4 +561,10 @@ pub fn json_to_moqui_value(val: &serde_json::Value) -> Result<Value, CoreError> 
             Ok(Value::Map(map))
         }
     }
+}
+
+pub fn decode_bridge_bytes(value: &serde_json::Value) -> Result<Vec<u8>, LibError> {
+    let encoded = value.as_str().or_else(|| value.get("__base64__").and_then(|v| v.as_str()))
+        .ok_or_else(|| LibError::new("Expected a base64 bridge buffer"))?;
+    BASE64.decode(encoded).map_err(|error| LibError::new(format!("Invalid bridge base64 buffer: {error}")))
 }

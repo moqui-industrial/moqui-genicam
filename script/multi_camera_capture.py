@@ -47,13 +47,17 @@ def _run_worker_process(camera, options):
         "camera": camera,
         "options": options,
     }
-    process = subprocess.run(
-        [sys.executable, __file__, "worker-video-file"],
-        input=json.dumps(worker_payload),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        process = subprocess.run(
+            [sys.executable, __file__, "worker-video-file"],
+            input=json.dumps(worker_payload), text=True, capture_output=True, check=False,
+            timeout=max(float(options.get("processTimeoutMs", 120000)) / 1000.0, 0.001),
+        )
+    except subprocess.TimeoutExpired:
+        return {"camera_index": camera.get("camera_index"), "device_id": camera.get("device_id"),
+                "serial_number": camera.get("serial_number"), "success": False,
+                "error": "Camera worker timed out; capture was not retried"}
+
 
     stdout_text = (process.stdout or "").strip()
     stderr_text = (process.stderr or "").strip()

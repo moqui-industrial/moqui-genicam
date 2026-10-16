@@ -16,6 +16,7 @@ pub mod client;
 pub mod multi_runner;
 pub mod services;
 pub mod util;
+mod worker;
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ submit_component! {
 
 pub fn register(registry: &mut NativeRegistry) -> Result<(), CoreError> {
     registry.tool("moqui_genicam::GenicamClientFactory", || {
-        Arc::new(client::GenicamToolFactory)
+        Arc::new(client::GenicamToolFactory::default())
     })?;
 
     registry.service_function(

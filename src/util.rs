@@ -54,33 +54,28 @@ pub fn resolve_serial_number(
         if let Some(options_str) = conn.get("options").and_then(|v| v.as_str()) {
             for entry in options_str.split(',') {
                 let mut parts = entry.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    if k.trim() == "serial" {
+                if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                    && k.trim() == "serial" {
                         return v.trim().to_string();
                     }
-                }
             }
         }
-        if let Some(dev) = device {
-            if let Some(serial) = dev.get("serialNumber").and_then(|v| v.as_str()) {
-                if !serial.trim().is_empty() {
+        if let Some(dev) = device
+            && let Some(serial) = dev.get("serialNumber").and_then(|v| v.as_str())
+                && !serial.trim().is_empty() {
                     return serial.trim().to_string();
                 }
-            }
-        }
-        if let Some(conn_name) = conn.get("connectionName").and_then(|v| v.as_str()) {
-            if !conn_name.trim().is_empty() {
+        if let Some(conn_name) = conn.get("connectionName").and_then(|v| v.as_str())
+            && !conn_name.trim().is_empty() {
                 return conn_name.trim().to_string();
             }
-        }
     }
 
     if let Some(dev) = device {
-        if let Some(serial) = dev.get("serialNumber").and_then(|v| v.as_str()) {
-            if !serial.trim().is_empty() {
+        if let Some(serial) = dev.get("serialNumber").and_then(|v| v.as_str())
+            && !serial.trim().is_empty() {
                 return serial.trim().to_string();
             }
-        }
         if let Some(dev_id) = dev.get("deviceId").and_then(|v| v.as_str()) {
             return dev_id.trim().to_string();
         }
@@ -105,11 +100,7 @@ pub fn resolve_runtime_path(ec: &ExecutionContext, location: &str) -> Result<Pat
         return Ok(p.to_path_buf());
     }
 
-    let runtime_base = if let Ok(res) = get_resource(ec).get("runtime") {
-        res.file_path().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("runtime"))
-    } else {
-        PathBuf::from("runtime")
-    };
+    let runtime_base = ec.factory().runtime_dir().to_path_buf();
 
     if let Some(rel) = trimmed.strip_prefix("runtime/") {
         Ok(runtime_base.join(rel))
@@ -178,11 +169,7 @@ pub fn resolve_video_codec(video_codec: Option<&str>) -> Result<String, LibError
 }
 
 pub fn resolve_python_executable(ec: &ExecutionContext) -> Result<PathBuf, LibError> {
-    let runtime_base = if let Ok(res) = get_resource(ec).get("runtime") {
-        res.file_path().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("runtime"))
-    } else {
-        PathBuf::from("runtime")
-    };
+    let runtime_base = ec.factory().runtime_dir().to_path_buf();
 
     let is_windows = cfg!(windows);
     let venv_python = if is_windows {
@@ -230,20 +217,15 @@ pub fn resolve_component_script_path(
     ec: &ExecutionContext,
     script_name: &str,
 ) -> Result<PathBuf, LibError> {
-    if let Ok(res) = get_resource(ec).get("component://moqui-genicam/script") {
-        if let Some(dir) = res.file_path() {
+    if let Ok(res) = get_resource(ec).get("component://moqui-genicam/script")
+        && let Some(dir) = res.file_path() {
             let file = dir.join(script_name);
             if file.exists() {
                 return Ok(file);
             }
         }
-    }
 
-    let runtime_base = if let Ok(res) = get_resource(ec).get("runtime") {
-        res.file_path().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("runtime"))
-    } else {
-        PathBuf::from("runtime")
-    };
+    let runtime_base = ec.factory().runtime_dir().to_path_buf();
 
     let candidates = [
         runtime_base.join("component").join("moqui-genicam").join("script").join(script_name),
@@ -264,40 +246,34 @@ pub fn resolve_component_script_path(
 pub fn build_python_runtime_config() -> serde_json::Value {
     let mut map = serde_json::Map::new();
 
-    if let Some(val) = resolve_config_property("genicam.connection.retry.count", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.connection.retry.count", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("connect_retry_count".to_string(), serde_json::Value::from(n));
         }
-    }
-    if let Some(val) = resolve_config_property("genicam.connection.retry.backoff.ms", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.connection.retry.backoff.ms", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("connect_retry_backoff_ms".to_string(), serde_json::Value::from(n));
         }
-    }
-    if let Some(val) = resolve_config_property("genicam.connection.fetch.timeout.ms", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.connection.fetch.timeout.ms", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("fetch_timeout_ms".to_string(), serde_json::Value::from(n));
         }
-    }
-    if let Some(val) = resolve_config_property("genicam.stream.stop.timeout.ms", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.stream.stop.timeout.ms", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("stream_stop_timeout_ms".to_string(), serde_json::Value::from(n));
         }
-    }
-    if let Some(val) = resolve_config_property("genicam.stream.mock.frame.delay.ms", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.stream.mock.frame.delay.ms", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("stream_mock_frame_delay_ms".to_string(), serde_json::Value::from(n));
         }
-    }
     let servo_src = resolve_config_property("genicam.servo.buffer.source", Some("latest"))
         .unwrap_or_else(|| "latest".to_string());
     map.insert("servo_buffer_source".to_string(), serde_json::Value::from(servo_src));
 
-    if let Some(val) = resolve_config_property("genicam.servo.max.frame.age.ms", None) {
-        if let Ok(n) = val.parse::<i64>() {
+    if let Some(val) = resolve_config_property("genicam.servo.max.frame.age.ms", None)
+        && let Ok(n) = val.parse::<i64>() {
             map.insert("servo_max_frame_age_ms".to_string(), serde_json::Value::from(n));
         }
-    }
 
     serde_json::Value::Object(map)
 }
@@ -458,6 +434,27 @@ pub fn sync_parameters(
     Ok(())
 }
 
+/// The Python worker has no ExecutionContext; persist image references on the Moqui side.
+pub fn store_image_content(ec: &ExecutionContext, device_id: &str, location: &str) -> Result<String, LibError> {
+    let entity = get_entity(ec)?;
+    let location = fs::canonicalize(location).map_err(|e| LibError::new(format!("Captured image is unavailable: {e}")))?
+        .to_string_lossy().replace('\\', "/");
+    if let Some(mut existing) = entity.find("moqui.device.DeviceContent")?
+        .eq("deviceId", Value::string(device_id)).eq("contentLocation", Value::string(&location)).one()? {
+        existing.set("contentDate", Value::Timestamp(Timestamp::now()));
+        existing.update(&entity)?;
+        return Ok(existing.get("deviceContentId").and_then(Value::as_str).unwrap_or_default().into());
+    }
+    let mut content = entity.make_value("moqui.device.DeviceContent")?;
+    content.set_sequenced_id_primary(&entity)?;
+    content.set("deviceId", Value::string(device_id));
+    content.set("contentLocation", Value::string(location));
+    content.set("contentTypeEnumId", Value::string("DCntImage"));
+    content.set("contentDate", Value::Timestamp(Timestamp::now()));
+    content.create(&entity)?;
+    Ok(content.get("deviceContentId").and_then(Value::as_str).unwrap_or_default().into())
+}
+
 pub fn store_tensor_payload(
     ec: &ExecutionContext,
     serial_number: &str,
@@ -473,8 +470,8 @@ pub fn store_tensor_payload(
     let npy_bytes = if let Some(base64_str) = payload.get("__base64__").and_then(|v| v.as_str()) {
         BASE64.decode(base64_str).map_err(|e| LibError::new(format!("Base64 decode error: {e}")))?
     } else if let Some(npy_val) = payload.get("npy_bytes") {
-        if let Some(b64) = npy_val.as_str() {
-            BASE64.decode(b64).map_err(|e| LibError::new(format!("Base64 decode error: {e}")))?
+        if npy_val.as_str().is_some() || npy_val.get("__base64__").is_some() {
+            crate::client::decode_bridge_bytes(npy_val)?
         } else if let Some(arr) = npy_val.as_array() {
             arr.iter().filter_map(|v| v.as_u64().map(|b| b as u8)).collect()
         } else {
@@ -484,15 +481,14 @@ pub fn store_tensor_payload(
         return Err(LibError::new("Missing 'npy_bytes' in tensor payload"));
     };
 
-    let shape: Vec<i64> = shape_arr.iter().filter_map(|v| v.as_i64()).collect();
+    let shape: Vec<i64> = shape_arr.iter().map(|v| v.as_i64().filter(|size| *size > 0)
+        .ok_or_else(|| LibError::new("Tensor dimensions must be positive integers"))).collect::<Result<_, _>>()?;
     if shape.is_empty() {
         return Err(LibError::new("Empty shape in tensor payload"));
     }
 
-    let mut total_elements: i64 = 1;
-    for dim in &shape {
-        total_elements *= dim;
-    }
+    let total_elements = shape.iter().try_fold(1i64, |size, dim| size.checked_mul(*dim))
+        .ok_or_else(|| LibError::new("Tensor size overflows integer range"))?;
 
     let mut tensor = entity.make_value("moqui.math.Tensor")?;
     tensor.set_sequenced_id_primary(&entity)?;
@@ -512,8 +508,8 @@ pub fn store_tensor_payload(
     for idx in 0..shape.len() {
         let axis_size = shape[idx];
         let mut axis_stride = 1i64;
-        for stride_idx in (idx + 1)..shape.len() {
-            axis_stride *= shape[stride_idx];
+        for size in shape.iter().skip(idx + 1) {
+            axis_stride *= size;
         }
 
         let mut axis = entity.make_value("moqui.math.TensorAxis")?;
@@ -550,6 +546,7 @@ pub fn store_tensor_payload(
     let tensor_content_id = tensor_content.get("tensorContentId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
     tensor_content.set("tensorId", Value::string(&tensor_id));
+    tensor_content.set("contentDate", Value::Timestamp(Timestamp::now()));
     tensor_content.set("contentTypeEnumId", Value::string("TCntNpy"));
     tensor_content.set("contentLocation", Value::string(&content_location));
     tensor_content.set("description", Value::string(format!("Numpy binary for Tensor {tensor_id}")));

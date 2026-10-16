@@ -52,7 +52,7 @@ try:
     logger.info("Harvesters library loaded successfully. Real hardware communication enabled.")
 except ImportError:
     HAS_HARVESTERS = False
-    logger.warning("Harvesters library not found. Falling back to Mock Camera Simulation.")
+    logger.warning("Harvesters library not found. Only explicitly selected mock cameras are available.")
 
 # Default paths for standalone usage
 DEFAULT_GENICAM_DIR = os.path.join("runtime", "genicam")
@@ -229,7 +229,7 @@ def _resize_frame_entry(frame_entry, resize_width=None, resize_height=None):
     encoded_bytes, normalized_format, content_type = _encode_image_bytes(image_array, normalized_format)
     jpeg_bytes = encoded_bytes if normalized_format == "jpg" else _encode_image_bytes(image_array, "jpg")[0]
 
-    return _build_frame_entry(encoded_bytes, frame_entry.get("component_index", 0),
+    return _derived_frame_entry(frame_entry, encoded_bytes, frame_entry.get("component_index", 0),
         frame_entry.get("data_format"), content_type, image_array.shape[1], image_array.shape[0],
         normalized_format, jpeg_bytes=jpeg_bytes, source=frame_entry.get("source", "capture"))
 
@@ -256,9 +256,16 @@ def _reencode_frame_entry(frame_entry, image_format):
     elif not jpeg_bytes:
         jpeg_bytes, _, _ = _encode_image_bytes(image_array, "jpg")
 
-    return _build_frame_entry(encoded_bytes, frame_entry.get("component_index", 0),
+    return _derived_frame_entry(frame_entry, encoded_bytes, frame_entry.get("component_index", 0),
         frame_entry.get("data_format"), content_type, frame_entry.get("width"), frame_entry.get("height"),
         normalized_format, jpeg_bytes=jpeg_bytes, source=frame_entry.get("source", "capture"))
+
+
+def _derived_frame_entry(original, *args, **kwargs):
+    result = _build_frame_entry(*args, **kwargs)
+    # Encoding/resizing does not turn an old observation into a fresh capture.
+    result["captured_at"] = original.get("captured_at")
+    return result
 
 
 def _normalize_resize_dimension(value):
@@ -287,12 +294,12 @@ def _resize_image_if_needed(image_array, resize_width=None, resize_height=None):
     return cv2.resize(image_array, (target_width, target_height))
 
 def _is_mock(cti_path, serial_number):
+    if cti_path == "mock" or serial_number == "FLIR_CAMERA_1" or "mock" in str(serial_number).lower():
+        return True
     if not HAS_HARVESTERS:
-        return True
-    if not cti_path or not os.path.exists(cti_path):
-        return True
-    if serial_number == "FLIR_CAMERA_1" or "mock" in str(serial_number).lower():
-        return True
+        raise RuntimeError("Harvesters is required for real cameras; select an explicit mock camera for simulation.")
+    if not cti_path or not os.path.isfile(cti_path):
+        raise FileNotFoundError(f"GenTL driver does not exist: {cti_path}")
     return False
 
 class CameraConnection:
@@ -359,14 +366,15 @@ def get_connection(cti_path, serial_number):
 
 def close_all_connections():
     """Closes all active camera connections (pool cleanup)."""
-    # First stop all active streaming threads
     with _streaming_threads_lock:
-        for serial, thread in list(_streaming_threads.items()):
-            try:
-                thread.stop()
-            except Exception as e:
-                logger.error(f"Error stopping streaming thread for {serial}: {e}")
+        threads = list(_streaming_threads.items())
         _streaming_threads.clear()
+    for serial, thread in threads:
+        thread.stop()
+    for serial, thread in threads:
+        thread.join(timeout=max(DEFAULT_STREAM_STOP_TIMEOUT_MS, 1) / 1000.0)
+        if thread.is_alive():
+            logger.error(f"Streaming thread did not stop within the deadline: {serial}")
 
     with _connections_lock:
         connections = list(_connections_cache.items())
@@ -754,7 +762,7 @@ def _is_frame_entry_stale(frame_entry, max_frame_age_ms):
     if captured_at is None:
         return True
     frame_age_ms = (time.time() - float(captured_at)) * 1000.0
-    return frame_age_ms > max_frame_age_ms
+    return frame_age_ms < 0 or frame_age_ms > max_frame_age_ms
 
 def _write_frame_entry_files(serial_number, frame_entry, output_dir, prefix):
     _ensure_output_dir(output_dir)
@@ -940,6 +948,7 @@ def acquire_visual_servo_frame(cti_path, serial_number, use_cached=True, save_sn
         frame_entry = _fetch_single_capture(cti_path, serial_number, image_format=image_format,
             resize_width=resize_width, resize_height=resize_height)
         frame_entry["source"] = "capture"
+        _cache_latest_frame(serial_number, frame_entry)
     else:
         frame_entry["source"] = "cache"
         frame_entry = _reencode_frame_entry(frame_entry, image_format)
@@ -1370,45 +1379,49 @@ def _encode_val(v):
     return v
 
 
+def _handle_payload(payload):
+    if payload.get("command") == "close-all":
+        close_all_connections()
+        return {"status": "success"}
+    runtime_config = payload.get("runtime_config")
+    if runtime_config:
+        configure_runtime(runtime_config)
+    result = run_action(payload.get("action"), payload.get("cti_path"), payload.get("serial_number"),
+        parameter_names=payload.get("parameter_names"), parameters_map=payload.get("parameters_map"),
+        ec=None, device_id=payload.get("device_id"))
+    return _encode_val(result)
+
+
 def main():
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "run-action":
-        payload_text = sys.stdin.read()
-        if not payload_text:
-            raise ValueError("Missing JSON payload on stdin.")
-        payload = json.loads(payload_text)
-
-        runtime_config = payload.get("runtime_config")
-        if runtime_config:
-            configure_runtime(runtime_config)
-
-        action = payload.get("action")
-        cti_path = payload.get("cti_path")
-        serial_number = payload.get("serial_number")
-        parameter_names = payload.get("parameter_names")
-        parameters_map = payload.get("parameters_map")
-        device_id = payload.get("device_id")
-
-        result = run_action(
-            action,
-            cti_path,
-            serial_number,
-            parameter_names=parameter_names,
-            parameters_map=parameters_map,
-            ec=None,
-            device_id=device_id,
-        )
-
-        encoded = _encode_val(result)
-        print(json.dumps(encoded, sort_keys=True))
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    if command == "serve":
+        try:
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                payload = {}
+                try:
+                    payload = json.loads(line)
+                    result = _handle_payload(payload)
+                except Exception as error:
+                    logger.exception("GenICam worker request failed")
+                    result = {"error": str(error)}
+                print(json.dumps(result, sort_keys=True), flush=True)
+                if payload.get("command") == "close-all":
+                    break
+        finally:
+            close_all_connections()
         return 0
-    elif len(sys.argv) > 1 and sys.argv[1] == "close-all":
+    if command == "run-action":
+        print(json.dumps(_handle_payload(json.load(sys.stdin)), sort_keys=True))
+        return 0
+    if command == "close-all":
         close_all_connections()
         print(json.dumps({"status": "success"}))
         return 0
-    else:
-        print("Usage: python genicam_bridge.py run-action < payload.json", file=sys.stderr)
-        return 1
+    print("Usage: python genicam_bridge.py [serve|run-action|close-all]", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

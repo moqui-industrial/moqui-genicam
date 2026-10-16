@@ -270,8 +270,11 @@ throughput are outside those regression tests.
 
 `moqui.genicam.GenicamServices.stream#LiveMjpeg` now streams JPEG parts
 progressively through MR-Moqui's native `web::ResponseStream`. Update/build
-MR-Moqui master with this API before building this component. It requires an
-active HTTP request; a headless service call returns an error.
+MR-Moqui with this API before building this component. The extension is published
+in [moqui-industrial/mr-moqui, native-http-streaming](https://github.com/moqui-industrial/mr-moqui/tree/native-http-streaming)
+and proposed upstream in [MR-Moqui PR #18](https://github.com/moqui/mr-moqui/pull/18).
+Until that PR is merged, build the framework from that branch. The service
+requires an active HTTP request; a headless call returns an error.
 
 Mount `component://moqui-genicam/screen/GenicamStream.xml` as a subscreen in your
 application. For example, inside its existing `<subscreens>` declaration:

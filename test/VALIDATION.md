@@ -41,3 +41,8 @@ but closing the factory rejects subsequent capture requests. Framework tests
 passed for nested output/stream handling (2) and on-demand host body disposal (1). Screen
 and ToolFactory configuration XSD validation passed. No physical-camera MJPEG
 throughput claim is made.
+
+The authenticated MJPEG check also passed after rebasing the streaming extension
+onto MR-Moqui master `ed51656`. The required framework extension is published in
+[PR #18](https://github.com/moqui/mr-moqui/pull/18) and the
+[moqui-industrial framework branch](https://github.com/moqui-industrial/mr-moqui/tree/native-http-streaming).

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" require-authentication="true">
+    <parameter name="deviceId" required="true"/>
+    <parameter name="connectionName"/>
+    <parameter name="maxFrames"/>
+    <parameter name="frameDelayMs"/>
+    <transition name="stream" method="get" read-only="true">
+        <service-call name="moqui.genicam.GenicamServices.stream#LiveMjpeg" in-map="context"/>
+        <default-response type="none"/>
+    </transition>
+    <widgets/>
+</screen>

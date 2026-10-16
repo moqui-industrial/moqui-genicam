@@ -83,7 +83,7 @@ flowchart TD
 | `acquire#VideoStream` | Captures a finite number of 2D/JPEG frames | `type="rust"` |
 | `acquire#VideoFile` | Records a short `.avi` or `.mp4` video file from the camera | `type="rust"` |
 | `acquire#MultiVideoFile` | Coordinates multi-camera video captures using separate worker processes | `type="rust"` |
-| `stream#LiveMjpeg` | Currently returns an explicit unsupported error in the headless Rust service | `type="rust"` |
+| `stream#LiveMjpeg` | Progressive JPEG multipart response in an authenticated HTTP screen; finite or continuous | `type="rust"` |
 | `acquire#GenICam3DFrame` | Decodes a GenDC 3D frame and persists it as a DB Tensor | `type="rust"` |
 | `clean#GenICamTensors` | Deletes old 3D tensor files and database records | `type="rust"` |
 
@@ -261,15 +261,64 @@ camera.
 The [component regression tests](test/README.md) exercise real Rust services
 against the Python mock camera, including image buffers and DeviceContent, 3D
 Tensor/NPY persistence, connection ownership and retention isolation. See [the validation record](test/VALIDATION.md) for executed checks.
-No physical
-camera commissioning or measured servo-loop latency is claimed.
+The Python acquisition path was previously tested with two physical FLIR cameras
+(as reported by the maintainer). The new Rust bridge/HTTP checks use explicit
+mock acquisition; measured Rust servo-loop latency and sustained hardware MJPEG
+throughput are outside those regression tests.
+
+## Live MJPEG over HTTP
+
+`moqui.genicam.GenicamServices.stream#LiveMjpeg` now streams JPEG parts
+progressively through MR-Moqui's native `web::ResponseStream`. Update/build
+MR-Moqui master with this API before building this component. It requires an
+active HTTP request; a headless service call returns an error.
+
+Mount `component://moqui-genicam/screen/GenicamStream.xml` as a subscreen in your
+application. For example, inside its existing `<subscreens>` declaration:
+
+```xml
+<subscreens-item name="GenicamStream"
+    location="component://moqui-genicam/screen/GenicamStream.xml"/>
+```
+
+The supplied screen requires authentication. Grant the application's users the
+appropriate screen/service artifact permissions, and use their authenticated
+session when requesting the stream. No anonymous camera endpoint is installed.
+With a mount at `/GenicamStream`, a browser image can use:
+
+```html
+<img src="/GenicamStream/stream?deviceId=YOUR_CAMERA&amp;maxFrames=0&amp;frameDelayMs=66"
+     alt="Live camera">
+```
+
+`connectionName` selects an optional modeled connection owned by the camera.
+`maxFrames` defaults to 100; `0` streams until disconnect. `frameDelayMs`
+defaults to 66 and accepts 1..60000 ms. The response uses
+`multipart/x-mixed-replace; boundary=moqui-frame`, with per-frame content lengths,
+a closing boundary for finite streams and no overall body buffering. Disable
+proxy buffering for this route (`X-Accel-Buffering: no` is sent).
+
+The first JPEG is acquired before the response starts, so initial camera errors
+return through normal service error handling. Later capture errors terminate
+the body. Frames use the persistent worker for the CTI/serial pair; different
+viewers of the same camera share that worker. Capture is requested as the HTTP
+body is consumed, with no unbounded frame queue. Disconnect drops the iterator
+after any in-flight capture/delay completes. Each IPC exchange has a 5-second
+response timeout; competing calls serialize on the shared camera worker.
+The delay is at most 60 seconds. Disconnect leaves the worker available to
+other calls; factory shutdown closes it and rejects subsequent acquisitions.
+A slow camera sets the achievable frame rate.
+
+The [HTTP test](test/mjpeg_http.py) checks progressive delivery, finite closure,
+continuous-stream disconnect and subsequent capture, using the explicit mock
+camera. See [test instructions](test/README.md).
 
 ## Native ONNX trajectory integration
 
 `moqui.device.TrajectoryPlannerServices.run#RobotArmTrajectoryPlanner` is an
 invocable Moqui service. With the optional `moqui-device/onnx` feature it loads
-the registered ONNX model and runs inference inside MR-Moqui through `ort` and
-ONNX Runtime; an HTTP provider is not required. The [isolated example](https://github.com/moqui/moqui-device/tree/mr-moqui/examples/onnx-obstacle)
+the registered ONNX model through a reusable `Onnx` ToolFactory session and runs
+inference inside MR-Moqui through `ort` and ONNX Runtime; an HTTP provider is not required. The [isolated example](https://github.com/moqui/moqui-device/tree/mr-moqui/examples/onnx-obstacle)
 includes the native call and an optional remote-provider mode.
 
 GenICam supplies frames and timestamps. A detector and camera-to-robot calibration

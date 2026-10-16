@@ -5,11 +5,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 type CameraKey = (String, String);
 #[derive(Default)]
-pub struct WorkerPool(Mutex<HashMap<CameraKey, Arc<Mutex<Worker>>>>);
+pub struct WorkerPool(Mutex<HashMap<CameraKey, Arc<Mutex<Worker>>>>, AtomicBool);
 
 impl WorkerPool {
     pub fn exchange(
@@ -25,6 +26,9 @@ impl WorkerPool {
                 .0
                 .lock()
                 .map_err(|_| Error::new("GenICam worker pool lock poisoned"))?;
+            if self.1.load(Ordering::Acquire) {
+                return Err(Error::new("GenICam factory is shutting down"));
+            }
             if !workers.contains_key(&key) {
                 workers.insert(
                     key.clone(),
@@ -65,6 +69,7 @@ impl WorkerPool {
     }
 
     pub fn close_all(&self) {
+        self.1.store(true, Ordering::Release);
         let workers: Vec<_> = self
             .0
             .lock()
@@ -212,6 +217,12 @@ mod tests {
         assert_eq!(first["captured_at"], second["captured_at"]);
         assert!(second["frame_bytes"]["__base64__"].as_str().is_some());
         pool.close(&key);
+        // Closing a single camera permits a later capture. Factory shutdown does not.
+        pool.exchange(key.clone(), Path::new("python3"), &script, &payload, Duration::from_secs(15))?;
+        pool.close_all();
+        let error = pool.exchange(key, Path::new("python3"), &script, &payload, Duration::from_secs(15)).unwrap_err();
+        assert!(error.to_string().contains("shutting down"));
+        assert!(pool.0.lock().unwrap().is_empty());
         Ok(())
     }
 }

@@ -17,6 +17,7 @@ pub mod multi_runner;
 pub mod services;
 pub mod util;
 mod worker;
+mod mjpeg;
 
 use std::sync::Arc;
 

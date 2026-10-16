@@ -549,11 +549,45 @@ pub fn acquire_visual_servo_frame(
 }
 
 pub fn stream_live_mjpeg(
-    _ec: &ExecutionContext,
+    ec: &ExecutionContext,
     _info: &ServiceInfo<'_>,
-    _parameters: &Parameters,
+    parameters: &Parameters,
 ) -> Result<Parameters, LibError> {
-    Err(LibError::new("Live MJPEG stream is not available in headless non-web environment."))
+    let device =
+        get_string(parameters, "deviceId").ok_or_else(|| LibError::new("deviceId is required"))?;
+    let connection = get_string(parameters, "connectionName");
+    let (_, _, cti, serial) = resolve_device_and_connection(ec, &device, connection.as_deref())?;
+    let max = get_i64(parameters, "maxFrames").unwrap_or(100);
+    let delay = get_i64(parameters, "frameDelayMs").unwrap_or(66);
+    if max < 0 || !(1..=60_000).contains(&delay) {
+        return Err(LibError::new(
+            "maxFrames must be nonnegative and frameDelayMs must be 1..60000",
+        ));
+    }
+    let factory = ec
+        .factory()
+        .get_tool_factory_typed::<crate::client::GenicamToolFactory>("GenicamClient")
+        .ok_or_else(|| LibError::new("GenicamClient factory is not configured"))?;
+    let mut source = crate::mjpeg::Mjpeg {
+        pool: factory.workers.clone(),
+        python: util::resolve_python_executable(ec)?,
+        script: util::resolve_component_script_path(ec, "genicam_bridge.py")?,
+        camera: (cti.clone(), serial.clone()),
+        payload: serde_json::json!({"command":"run-action", "action":"visual_servo_frame", "cti_path":cti,
+            "serial_number":serial, "runtime_config":util::build_python_runtime_config(), "parameters_map":{"use_cached":false,"save_snapshot":false,"image_format":"jpg"}}),
+        timeout: std::time::Duration::from_secs(5),
+        delay: std::time::Duration::from_millis(delay as u64),
+        remaining: if max == 0 { None } else { Some(max as usize) },
+        first: None,
+        last: None,
+        ended: false,
+    };
+    source.first = Some(source.frame().map_err(|e| LibError::new(e.to_string()))?);
+    moqui_core::web::send_stream(
+        "multipart/x-mixed-replace; boundary=moqui-frame",
+        moqui_core::web::ResponseStream::new(source),
+    )?;
+    Ok(Parameters::new())
 }
 
 pub fn acquire_genicam_3d_frame(

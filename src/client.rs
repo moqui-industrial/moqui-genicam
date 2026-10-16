@@ -302,7 +302,7 @@ impl GenicamClient {
 }
 
 #[derive(Default)]
-pub struct GenicamToolFactory { pub(crate) workers: crate::worker::WorkerPool }
+pub struct GenicamToolFactory { pub(crate) workers: Arc<crate::worker::WorkerPool> }
 
 impl ToolFactory for GenicamToolFactory {
     fn name(&self) -> &str {

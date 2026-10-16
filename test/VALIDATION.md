@@ -23,7 +23,21 @@ properties precede tool declarations as required by the framework schema.
 
 Filesystem writes/deletions are not transactional with the database. Retention
 keeps Tensor/Axis metadata and skips other components' files/custom output roots.
-Real camera SDK lifecycle, long-running frame throughput and physical robot
-commissioning still require hardware validation. The live MJPEG native service
-currently returns an explicit unsupported error. The obstacle detector/calibration
-stage is simulated by the separate moqui-device ONNX example.
+The maintainer reports prior Python-path validation with two real FLIR cameras.
+This report records the Rust/mock checks separately: it does not repeat or
+invalidate that hardware work. Rust SDK lifecycle and sustained frame throughput
+still need hardware measurements. The obstacle detector/calibration stage is
+simulated by the separate moqui-device ONNX example.
+
+MJPEG follow-up: a real loopback HTTP test passed with the new native response
+stream, the persistent Python worker and explicit mock camera. It verified two
+progressively delivered JPEG parts separated by the requested delay, finite
+closing boundary, unlimited-stream disconnect and a subsequent camera request.
+The distributed screen was also exercised with an authenticated browser session
+and explicit application artifact permissions: anonymous access was rejected,
+and the finite/progressive/unlimited/disconnect checks passed with that session.
+The worker test additionally verifies that closing a camera permits reopening
+but closing the factory rejects subsequent capture requests. Framework tests
+passed for nested output/stream handling (2) and on-demand host body disposal (1). Screen
+and ToolFactory configuration XSD validation passed. No physical-camera MJPEG
+throughput claim is made.

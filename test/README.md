@@ -30,3 +30,17 @@ python3 -m unittest discover -s test -p 'test_*.py'
 ```
 
 See [VALIDATION.md](VALIDATION.md) for executed checks and their limits.
+
+For HTTP streaming, mount the authenticated `GenicamStream.xml` screen as
+explained in the component README. Load the mock-camera test data into an
+isolated application runtime and start its HTTP server. From the component:
+
+```bash
+python3 test/mjpeg_http.py --url http://127.0.0.1:8080/GenicamStream/stream \
+  --cookie 'moqui.session=YOUR_AUTHENTICATED_SESSION_COOKIE'
+```
+
+Use the actual cookie name/value returned by your application. The test requests
+the explicit `FLIR_CAMERA_1` mock fixture, verifies progressive JPEG parts and
+finite closure, disconnects an unlimited stream, then captures again. It needs
+the MR-Moqui native response-stream extension. It creates no image snapshots.

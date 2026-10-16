@@ -127,7 +127,7 @@ along with this software (see the LICENSE.md file). If not, see
         </out-parameters>
     </service>
 
-    <service verb="stream" noun="LiveMjpeg" type="rust" location="moqui_genicam::services::stream_live_mjpeg" authenticate="false" transaction="ignore">
+    <service verb="stream" noun="LiveMjpeg" type="rust" location="moqui_genicam::services::stream_live_mjpeg" authenticate="true" transaction="ignore">
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>

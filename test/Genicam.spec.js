@@ -60,6 +60,30 @@ feature("the latest frame of the streaming thread is read as a file path", {
     },
 });
 
+const isJpeg = bytes => bytes != null && bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+
+feature("the live view gets the latest frame of the streaming thread as JPEG", {
+    when() {
+        const live = () => call("moqui.genicam.GenicamServices.get#LiveFrame", {deviceId:"FLIR_CAMERA_1"});
+        const stopped = live();
+        call("moqui.device.DeviceServices.run#DeviceRequest", {requestName:"FLIR_StartStreaming"});
+        // the mock streaming thread caches a frame every genicam.stream.mock.frame.delay.ms
+        let streaming = live();
+        const deadline = Date.now() + 5000;
+        while (streaming.source != "stream" && Date.now() < deadline) streaming = live();
+        call("moqui.device.DeviceServices.run#DeviceRequest", {requestName:"FLIR_StopStreaming"});
+        return {stopped, streaming};
+    },
+    then(out) {
+        // the placeholder before any streaming; the last cached frame after a stream stopped (an earlier feature)
+        ["fallback", "stream"].includes(out.stopped.source);
+        isJpeg(out.stopped.jpegBytes);
+        out.streaming.source == "stream";
+        isJpeg(out.streaming.jpegBytes);
+        out.streaming.capturedAt != null;
+    },
+});
+
 feature("a single image is saved and registered as DeviceContent", {
     when() {
         const output = call("moqui.genicam.GenicamServices.acquire#SingleImage", {deviceId:"FLIR_CAMERA_1"});

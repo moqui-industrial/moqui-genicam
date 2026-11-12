@@ -1386,6 +1386,11 @@ def _handle_request(request):
         close_all_connections()
         return {"status": "success"}
     configure_runtime(request.get("runtime_config"))
+    if request.get("action") == "get_live_frame":
+        # The live view needs the JPEG of the latest frame and its source, not the raw frame bytes of get_frame_payload.
+        entry = _get_latest_frame_entry(request.get("serial_number"))
+        return _encode_value({"jpeg_bytes": entry.get("jpeg_bytes"), "source": entry.get("source"),
+            "captured_at": entry.get("captured_at")})
     result = run_action(request.get("action"), request.get("cti_path"), request.get("serial_number"),
         parameter_names=request.get("parameter_names"), parameters_map=request.get("parameters_map"),
         ec=None, device_id=request.get("device_id"))

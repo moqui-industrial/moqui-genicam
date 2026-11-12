@@ -21,7 +21,7 @@ DeviceContent, Tensor and Parameter rows and their files.
 ## What the tests cover
 
 - reads and writes through `run#DeviceRequest` and `store#Samples`;
-- the streaming thread and its latest frame;
+- the streaming thread and its latest frame, as a file and as the JPEG of the live view;
 - single images, frame series, video files and multi-camera recordings;
 - visual servo frames;
 - 3D frames as Tensors, and their retention;

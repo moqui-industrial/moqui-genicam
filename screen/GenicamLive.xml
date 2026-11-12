@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- The live view of a camera: /genicam?deviceId=...&connectionName=... shows the latest frame of the camera's
+    streaming thread and asks for a new one every genicam.live.refresh.ms milliseconds (MoquiConf.xml), as a dashboard
+    panel refreshes. Each refresh is one request to the transition "frame", which answers one JPEG image. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        standalone="true" default-menu-include="false">
+
+    <transition name="frame" read-only="true" begin-transaction="false">
+        <parameter name="deviceId"/>
+        <parameter name="connectionName"/>
+        <actions>
+            <script><![CDATA[
+                const response = ec.web.response
+                const frame = ec.service.sync().name("moqui.genicam.GenicamServices.get#LiveFrame")
+                    .parameters({deviceId, connectionName}).call()
+                if (ec.message.hasError() || !frame || !frame.jpegBytes || !frame.jpegBytes.length) {
+                    const message = ec.message.hasError() ? ec.message.getErrorsString() : "No frame from the camera"
+                    ec.message.clearErrors()
+                    response.setContentType("text/plain; charset=UTF-8")
+                    response.setStatus(503)
+                    response.write(message)
+                    return
+                }
+                response.setContentType("image/jpeg")
+                response.setHeader("Cache-Control", "no-store")
+                response.setHeader("X-Genicam-Source", String(frame.source || ""))
+                response.write(frame.jpegBytes)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="refreshMs" from="Math.max(parseInt(String(System.getProperty('genicam.live.refresh.ms') || '500'), 10) || 500, 50)"/>
+    </actions>
+
+    <widgets>
+        <render-mode>
+            <text type="html"><![CDATA[<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GenICam Live</title>
+<style>
+    body { margin: 0; background: #111; color: #ddd; font: 14px sans-serif; }
+    main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px; }
+    img { max-width: 100%; height: auto; background: #000; }
+    #status { min-height: 1.2em; }
+</style>
+</head>
+<body>
+<main>
+    <img id="frame" alt="Camera">
+    <div id="status"></div>
+</main>
+<script>
+(function () {
+    var refreshMs = ${refreshMs};
+    var query = new URLSearchParams(location.search);
+    var params = new URLSearchParams();
+    if (query.get("deviceId")) params.set("deviceId", query.get("deviceId"));
+    if (query.get("connectionName")) params.set("connectionName", query.get("connectionName"));
+    var frameUrl = location.pathname.replace(/\/$/, "") + "/frame?" + params.toString();
+    var image = document.getElementById("frame");
+    var status = document.getElementById("status");
+    var objectUrl = null;
+    var timer = null;
+
+    if (!params.get("deviceId")) { status.textContent = "Add ?deviceId=... to the address."; return; }
+
+    // One request at a time: the next one is scheduled when the previous one is answered, and none while hidden.
+    function schedule() {
+        clearTimeout(timer);
+        if (!document.hidden) timer = setTimeout(refresh, refreshMs);
+    }
+    function refresh() {
+        fetch(frameUrl, {cache: "no-store", credentials: "same-origin"}).then(function (response) {
+            if (response.status === 401 || response.status === 403) {
+                status.textContent = "Not authorized: sign in again and reload the page.";
+                return null;
+            }
+            if (!response.ok) {
+                return response.text().then(function (text) { status.textContent = text || response.statusText; schedule(); });
+            }
+            var source = response.headers.get("X-Genicam-Source");
+            status.textContent = source === "fallback" ? "No frame yet: start the camera's streaming thread." : "";
+            return response.blob().then(function (blob) {
+                var previous = objectUrl;
+                objectUrl = URL.createObjectURL(blob);
+                image.src = objectUrl;
+                if (previous) URL.revokeObjectURL(previous);
+                schedule();
+            });
+        }).catch(function (error) { status.textContent = String(error); schedule(); });
+    }
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+    refresh();
+})();
+</script>
+</body>
+</html>]]></text>
+        </render-mode>
+    </widgets>
+</screen>

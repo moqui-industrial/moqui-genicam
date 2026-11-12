@@ -3,7 +3,7 @@
 `moqui-genicam` connects GenICam vision cameras (FLIR/Teledyne, Basler, IDS, Baumer and others with a GenTL
 producer) to the device model of [moqui-device](https://github.com/moqui/moqui-device). It configures and reads
 cameras, captures images, frame series, video files, multi-camera recordings and 3D (Time-of-Flight) frames, and
-streams live MJPEG to a browser.
+shows a camera live in a browser page.
 
 | Branch | Content |
 |---|---|
@@ -55,7 +55,7 @@ All are in `moqui.genicam.GenicamServices`.
 | `acquire#VideoFile` | An avi or mp4 file of `numFrames` frames at `fps` |
 | `acquire#MultiVideoFile` | A video file on each camera of `deviceIdList` at the same time, each camera in a Python process of its own |
 | `acquire#VisualServoFrame` | One frame for a visual servoing loop: the latest frame of the streaming thread, or a new capture, with its bytes and capture time; optionally saved as a `DeviceContent` |
-| `stream#LiveMjpeg` | A `multipart/x-mixed-replace` response of `maxFrames` JPEG frames, one every `frameDelayMs`, each sent as it is written. Needs a web request and an authenticated user: the servlet `script/GenicamStreamServlet.js` (see Live MJPEG) |
+| `get#LiveFrame` | The latest JPEG frame of the streaming thread, for the live view (see Live view). Needs an authenticated user |
 | `acquire#GenICam3DFrame` | A GenDC 3D frame as a moqui-math `Tensor`, with one `TensorAxis` per dimension and the NPY file as `TensorContent` |
 | `clean#GenICamTensors` | Deletes the 3D frames older than `daysToKeep`: NPY file, `TensorContent`, `TensorAxis` and `Tensor`, one transaction per tensor. The job `clean_GenICamTensors_daily` runs it at 02:00 |
 
@@ -132,55 +132,39 @@ These are the default properties of `MoquiConf.xml`. A service parameter of the 
 | `genicam.frames.default.numFrames`, `genicam.videos.default.numFrames`, `genicam.videos.default.fps` | `10`, `60`, `15.0` | Frame counts and rate |
 | `genicam.<images,frames,videos,servo>.resize.width/height` | empty | Resize of the frames |
 | `genicam.connection.retry.count`, `.retry.backoff.ms`, `.fetch.timeout.ms` | `3`, `1000`, `1000` | Connection retries with exponential backoff, and the frame fetch timeout |
-| `genicam.stream.max.frames`, `genicam.stream.frame.delay.ms` | `100`, `66` | Live MJPEG |
+| `genicam.live.refresh.ms` | `500` | How often the live view asks for a new frame |
 | `genicam.stream.stop.timeout.ms`, `genicam.stream.mock.frame.delay.ms` | `3000`, `100` | Streaming thread |
 | `genicam.servo.default.useCachedFrame`, `.saveSnapshot`, `genicam.servo.buffer.source`, `genicam.servo.max.frame.age.ms` | `true`, `false`, `latest`, `250` | Visual servoing |
 | `genicam.process.timeout.ms` | `120000` | The longest wait for an answer of a camera's worker |
 | `genicam.multi.process.timeout.ms` | `120000` | The longest multi-camera recording |
 
-## Live MJPEG
+## Live view
 
-`stream#LiveMjpeg` writes its response frame by frame. On MR-Moqui a response goes out while it is written only from a
-render or from a servlet script; a screen transition sends it whole at the end. The component ships the servlet
-`script/GenicamStreamServlet.js`, and the application declares it in its conf, in the `webroot` webapp.
-
-When a webapp declares a servlet it no longer gets the default ones, so the conf declares them too:
-
-```xml
-<webapp-list>
-    <webapp name="webroot">
-        <servlet name="MoquiServlet" class="org.moqui.impl.webapp.MoquiServlet"><url-pattern>/*</url-pattern></servlet>
-        <servlet name="MoquiFopServlet" class="org.moqui.impl.webapp.MoquiFopServlet"><url-pattern>/fop/*</url-pattern></servlet>
-        <servlet name="GenicamStream" location="component://moqui-genicam/script/GenicamStreamServlet.js">
-            <url-pattern>/genicam/stream</url-pattern>
-        </servlet>
-    </webapp>
-</webapp-list>
-```
-
-The users who watch need permission on the service `moqui.genicam.GenicamServices.stream#LiveMjpeg`, for example an
-`ArtifactGroupMember` (`AT_SERVICE`) of an `ArtifactGroup` granted to their user group. A browser of a signed-in user
-then shows the camera with:
-
-```html
-<img src="/genicam/stream?deviceId=FLIR_CAMERA_1&amp;maxFrames=300&amp;frameDelayMs=66" alt="Camera">
-```
+The page `/genicam?deviceId=FLIR_CAMERA_1` shows a camera live, as a dashboard panel does: it asks for the latest
+frame every `genicam.live.refresh.ms` milliseconds (`MoquiConf.xml`, 500 by default). Each refresh is one ordinary
+request to the screen transition `/genicam/frame`, which answers one JPEG image through `get#LiveFrame`.
 
 | Parameter | Use |
 |---|---|
 | `deviceId` | The camera (required) |
 | `connectionName` | One of the camera's connections, else its own |
-| `maxFrames` | The frames to send (`genicam.stream.max.frames`, 100) |
-| `frameDelayMs` | The pause between frames (`genicam.stream.frame.delay.ms`, 66) |
 
 - **Source of the frames.** The frames are the latest frames of the camera's streaming thread. Start it first with a
-  `DrtWrite` of `AcquisitionStart`, as the request `FLIR_StartStreaming` does.
-- **Disconnected clients.** A script cannot see that the client went away, so a stream always ends after `maxFrames`
-  frames, as the Java version did. Set `maxFrames` to the length of the view and reload the image to go on.
-- **Request deadline.** A script on a request thread stops at the request deadline (`webapp_request_timeout`, 300 s):
-  keep `maxFrames` × `frameDelayMs` below it.
-- **Threads and workers.** Each viewer holds a request thread while the stream lasts, and the viewers of one camera
-  share its worker.
+  `DrtWrite` of `AcquisitionStart`, as the request `FLIR_StartStreaming` does. Until the thread has a frame, the
+  bridge answers a placeholder image and the page says so; after the thread stops, the page shows its last frame.
+- **Refresh.** The page sends one request at a time: the next one leaves when the previous one is answered. It sends
+  none while the browser tab is hidden, and none at all once the page is closed. A failed refresh keeps the last image
+  and shows the error under it.
+- **Access.** The screen is `screen/GenicamLive.xml`, mounted in `webroot` by `MoquiConf.xml`. The page needs a
+  signed-in user with view permission on the artifact group `GENICAM_LIVE`, which covers the screen and, through it,
+  `get#LiveFrame`. The seed data grants it to the `ADMIN` group; grant other user groups with an `ArtifactAuthz`:
+
+```xml
+<moqui.security.ArtifactAuthz artifactAuthzId="GENICAM_LIVE_OPERATORS" userGroupId="OPERATORS"
+        artifactGroupId="GENICAM_LIVE" authzTypeEnumId="AUTHZT_ALLOW" authzActionEnumId="AUTHZA_VIEW"/>
+```
+
+- **Embedding.** Another page can show the view in an `iframe`, or fetch `/genicam/frame?deviceId=...` itself.
 
 ## Multi-camera recording
 
@@ -265,8 +249,8 @@ The tests use the mock camera: no camera, SDK or Harvesters is needed, but NumPy
 | `src/worker.rs` | The Python worker processes, in place of the JEP interpreter |
 | `script/genicam_bridge.py` | The camera: Harvesters, GenDC decoding, image and video encoding, streaming thread, mock camera |
 | `script/multi_camera_capture.py` | The multi-camera recording processes |
-| `script/GenicamStreamServlet.js` | The live MJPEG servlet, declared by the application's conf |
+| `screen/GenicamLive.xml` | The live view page and its transition `frame` |
 | `data/` | Seed data and test data |
 | `test/` | The regression tests |
-| `MoquiConf.xml` | The default properties and the tool factories |
+| `MoquiConf.xml` | The default properties, the live view screen and the tool factories |
 | `requirements.txt` | The Python packages |

@@ -272,22 +272,21 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
 
-    <service verb="stream" noun="LiveMjpeg" transaction="ignore">
-        <description>The camera as a multipart/x-mixed-replace response of maxFrames JPEG frames, one every
-            frameDelayMs, each sent to the client as it is written. Only in a web request whose response can go out while it
-            is written: the servlet script/GenicamStreamServlet.js (README.md, Live MJPEG). It needs an authenticated user
-            with permission on this service.</description>
+    <service verb="get" noun="LiveFrame" transaction="ignore">
+        <description>The latest JPEG frame of the camera's streaming thread, for the live view (screen GenicamLive.xml,
+            README.md, Live view): each refresh of the view asks for one frame. source is "stream" for a frame of the
+            streaming thread and "fallback" for the placeholder image the bridge gives before the thread cached a
+            frame; after the thread stops, its last frame is given again. It needs an authenticated user.</description>
         <in-parameters>
             <parameter name="deviceId" required="true"/>
             <parameter name="connectionName"/>
-            <parameter name="maxFrames" type="Integer"/>
-            <parameter name="frameDelayMs" type="Long"/>
         </in-parameters>
         <out-parameters>
-            <parameter name="sentFrames" type="Integer"/>
+            <parameter name="jpegBytes"/>
+            <parameter name="source"/>
+            <parameter name="capturedAt"/>
         </out-parameters>
         <actions>
-            <if condition="!ec.web"><return error="true" message="This service must be called in a web request context."/></if>
             <entity-find-one entity-name="moqui.device.Device" value-field="device"/>
             <if condition="!device"><return error="true" message="Device not found: ${deviceId}"/></if>
             <if condition="connectionName">
@@ -305,8 +304,10 @@ along with this software (see the LICENSE.md file). If not, see
                 <return error="true" message="Connection transportConfig must specify driver path."/>
             </if>
             <set field="genicam" from="ec.resource.script('component://moqui-genicam/service/moqui/genicam/Genicam.js')"/>
-            <set field="answer" from="genicam.execute('liveMjpeg', context)"/>
-            <set field="sentFrames" from="answer.sentFrames"/>
+            <set field="answer" from="genicam.execute('liveFrame', context)"/>
+            <set field="jpegBytes" from="answer.jpegBytes"/>
+            <set field="source" from="answer.source"/>
+            <set field="capturedAt" from="answer.capturedAt"/>
         </actions>
     </service>
 

@@ -312,32 +312,11 @@ function visualServoFrame(p) {
         previewDeviceContentId: storeDeviceContent(p.deviceId, result.preview_location, "GenICam visual servo preview")}
 }
 
-// stream#LiveMjpeg: the latest frame of the camera's streaming thread, maxFrames times, as a multipart response; each
-// frame is flushed to the client as it is written.
-function liveMjpeg(p) {
-    const response = ec.web.response
-    if (!response) throw new Error("This service must be called in a web request context.")
-    const maxFrames = configuredInteger(p.maxFrames, "genicam.stream.max.frames") || 0
-    const frameDelayMs = configuredInteger(p.frameDelayMs, "genicam.stream.frame.delay.ms") || 0
-    response.setContentType("multipart/x-mixed-replace; boundary=frame")
-    response.setHeader("Cache-Control", "no-cache, private, must-revalidate")
-    response.setHeader("Pragma", "no-cache")
-    response.setHeader("X-Accel-Buffering", "no")
-    let frames = 0
-    withCamera(p.device, p.connection, client => {
-        for (let frameCount = 0; frameCount < maxFrames; frameCount++) {
-            const jpegBytes = client.getFrameBytes()
-            if (jpegBytes && jpegBytes.length) {
-                response.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegBytes.length}\r\n\r\n`)
-                response.write(jpegBytes)
-                response.write("\r\n")
-                response.flushBuffer()
-                frames++
-            }
-            client.pause(frameDelayMs)
-        }
-    })
-    return {sentFrames: frames}
+// get#LiveFrame: the latest frame of the camera's streaming thread as JPEG, one per refresh of the live view.
+function liveFrame(p) {
+    const frame = withCamera(p.device, p.connection, client => client.getLiveFrame()) || {}
+    return {jpegBytes: frame.jpeg_bytes, source: frame.source,
+        capturedAt: frame.captured_at == null ? null : String(frame.captured_at)}
 }
 
 function acquire3dFrame(p) {
@@ -385,7 +364,7 @@ function cleanTensors(p) {
     return {deletedCount}
 }
 
-const operations = {runRequest, singleImage, videoStream, videoFile, multiVideoFile, visualServoFrame, liveMjpeg,
+const operations = {runRequest, singleImage, videoStream, videoFile, multiVideoFile, visualServoFrame, liveFrame,
     acquire3dFrame, cleanTensors}
 ;({
     execute(op, parameters) {

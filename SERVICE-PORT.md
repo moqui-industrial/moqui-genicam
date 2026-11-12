@@ -12,19 +12,21 @@ follows the layout of moqui-device and moqui-device-gateway on MR-Moqui:
 - **Groovy classes.** A Groovy class is a Rust tool, taken with `ec.getTool(...)`.
 - **Python.** The Python scripts are the camera side and are not ported: Harvesters and the GenTL producer of the
   camera vendor (Teledyne FLIR Spinnaker) are what the camera SDK offers. `genicam_bridge.py` only gains, at its end,
-  the loop that runs it as a worker process in place of JEP. `multi_camera_capture.py` is unchanged.
+  the loop that runs it as a worker process in place of JEP, with the `get_live_frame` answer of the live view (the
+  JPEG of the latest frame without its raw bytes). `multi_camera_capture.py` is unchanged.
 
 ## Migration map
 
 | Java/Groovy | MR-Moqui |
 | --- | --- |
-| `org.moqui.genicam.GenicamClient` | Rust tool `GenicamClient` (`src/client.rs`): the same methods, plus `pause(millis)`, the `Thread.sleep` of the live stream |
+| `org.moqui.genicam.GenicamClient` | Rust tool `GenicamClient` (`src/client.rs`): the same methods |
 | `org.moqui.genicam.GenicamMultiCameraRunner` | Rust tool `GenicamMultiCameraRunner` (`src/multi_camera.rs`): the same process, request on stdin, timeout and report |
 | `org.moqui.genicam.GenicamUtil` | `Genicam.js` (configuration, serial number, parameters map, Tensor records); `buildPythonRuntimeConfig`, `resolvePythonExecutable` and `resolveComponentScriptPath` in the Rust tools |
 | JEP interpreter (`JepToolFactory`, `moqui-jep`) | A Python worker process per camera (`src/worker.rs`), JSON lines on stdin and stdout, kept between calls as the interpreter was |
-| Groovy scripts of `GenicamServices.xml` | `Genicam.js` operations: `runRequest`, `singleImage`, `videoStream`, `videoFile`, `multiVideoFile`, `visualServoFrame`, `liveMjpeg`, `acquire3dFrame`, `cleanTensors` |
+| Groovy scripts of `GenicamServices.xml` | `Genicam.js` operations: `runRequest`, `singleImage`, `videoStream`, `videoFile`, `multiVideoFile`, `visualServoFrame`, `liveFrame`, `acquire3dFrame`, `cleanTensors` |
 | `GenicamUtil.syncParameters` (Parameter update and `ParameterLog` row per value) | `moqui.device.DeviceAcquisitionServices.store#Samples`, as the drivers of moqui-device-gateway |
 | Bridge writes with `ec` in JEP: `DeviceContent` rows, `Device` status `DbsErrorStop` | `Genicam.js` (`storeDeviceContent`, `markDeviceError`); the worker has no ExecutionContext |
+| `stream#LiveMjpeg` (a `multipart/x-mixed-replace` response) | `get#LiveFrame` and the live view `screen/GenicamLive.xml`: one JPEG per request, refreshed by the page |
 | `build.gradle`, Spock tests (`src/test/groovy`) | `Cargo.toml`; `test/Genicam.spec.js`, with the real-camera test behind `genicam_real_enabled` |
 
 ## Differences from the Java version
@@ -43,12 +45,17 @@ follows the layout of moqui-device and moqui-device-gateway on MR-Moqui:
     `clean#GenICamTensors` never found a frame.
   - `clean#GenICamTensors` deletes only GenICam tensors under the tensor directory (`outputDir` or
     `genicam.tensors.path`); the Groovy version deleted every NPY tensor.
-- **Live stream.** `stream#LiveMjpeg` needs an authenticated user with permission on the service. It writes each
-  frame with `ec.web.response.write` and sends it with `flushBuffer()`.
-  - A response goes out while it is written only from a servlet script, so the component ships
-    `script/GenicamStreamServlet.js`, which the application declares in its conf.
-  - A script cannot see a client that went away, so the stream ends after `maxFrames` frames, as the Groovy loop did
-    without an `IOException`.
+- **Live view in place of the MJPEG stream.** `stream#LiveMjpeg` is replaced by `get#LiveFrame`, which answers one
+  JPEG frame, and the page `screen/GenicamLive.xml` (`/genicam?deviceId=...`), which asks for a new frame every
+  `genicam.live.refresh.ms` milliseconds, as a dashboard panel refreshes.
+  - On MR-Moqui a screen transition sends its response whole when it ends, so a stream of frames would arrive all
+    at once. A frame per request needs no servlet and no change to the application's conf.
+  - Each request is short: no request thread stays busy while a viewer watches, and the requests stop when the page
+    is closed, where a stream went on to `maxFrames` frames.
+  - The properties `genicam.stream.max.frames` and `genicam.stream.frame.delay.ms` are replaced by
+    `genicam.live.refresh.ms`.
+  - The seed artifact group `GENICAM_LIVE` covers the page and, through it, `get#LiveFrame`; it is granted to
+    `ADMIN`.
 - **Worker timeout.** `genicam.process.timeout.ms` limits the answer of a camera's worker. A call that times out
   stops the worker and its command is not sent again.
 - **Python interpreter.** It is `runtime/python_venv` as in the Java version, then `PYTHON`, then the `PATH`.

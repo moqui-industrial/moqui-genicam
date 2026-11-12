@@ -18,6 +18,14 @@ along with this software (see the LICENSE.md file). If not, see
     <moqui.basic.Enumeration description="GenICam Camera" enumId="DcdGenicam" enumCode="genicam" enumTypeId="DeviceConnectionDriver"/>
     <moqui.basic.Enumeration description="String/Text" enumId="DritString" enumTypeId="DeviceRequestItemType"/>
 
+    <!-- The live view: the screen and, through it, get#LiveFrame. Administrators may use it; grant other user groups an
+        ArtifactAuthz on GENICAM_LIVE. -->
+    <moqui.security.ArtifactGroup artifactGroupId="GENICAM_LIVE" description="GenICam camera live view"/>
+    <moqui.security.ArtifactGroupMember artifactGroupId="GENICAM_LIVE" artifactTypeEnumId="AT_XML_SCREEN" inheritAuthz="Y"
+            artifactName="component://moqui-genicam/screen/GenicamLive.xml"/>
+    <moqui.security.ArtifactAuthz artifactAuthzId="GENICAM_LIVE_ADMIN" userGroupId="ADMIN" artifactGroupId="GENICAM_LIVE"
+            authzTypeEnumId="AUTHZT_ALWAYS" authzActionEnumId="AUTHZA_VIEW"/>
+
     <!-- Scheduled Service Job for Cleaning Old ToF Tensors -->
     <moqui.service.job.ServiceJob jobName="clean_GenICamTensors_daily" description="Clean Old GenICam 3D ToF Tensors"
             serviceName="moqui.genicam.GenicamServices.clean#GenICamTensors" cronExpression="0 0 2 * * ?" paused="N">

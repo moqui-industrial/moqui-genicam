@@ -24,9 +24,10 @@
 //! - `acquireVideoStream(numFrames, outputDir, imageFormat, resizeWidth, resizeHeight)`
 //! - `acquireVideoFile(numFrames, fps, outputDir, videoContainer, videoCodec, resizeWidth, resizeHeight)`
 //! - `acquire3dFrame()`, `getFrameBytes()`, `getFramePayload()`
+//! - `getLiveFrame()`: the JPEG of the latest frame with its `source` and `captured_at`, without the raw frame bytes
+//!   (the live view).
 //! - `acquireVisualServoFrame(useCachedFrame, saveSnapshot, outputDir, imageFormat, resizeWidth, resizeHeight)`
 //! - `close()`: ends the camera's worker (connection, streaming thread, latest frame).
-//! - `pause(millis)`: waits, as the Groovy live stream did with `Thread.sleep` between frames.
 //!
 //! The Java version ran `script/genicam_bridge.py` in a JEP interpreter; here it runs in a Python worker process per
 //! camera (worker.rs), which the factory keeps until `close()` or shutdown. The answers keep the bridge's names; its
@@ -86,8 +87,9 @@ impl ToolFactory for GenicamClientFactory {
              acquireVideoStream(numFrames: number, outputDir: string, imageFormat: string, resizeWidth?: number | null, resizeHeight?: number | null): any; \
              acquireVideoFile(numFrames: number, fps: number, outputDir: string, videoContainer: string, videoCodec: string, resizeWidth?: number | null, resizeHeight?: number | null): any; \
              acquire3dFrame(): any; getFrameBytes(): Uint8Array; getFramePayload(): any; \
+             getLiveFrame(): { jpeg_bytes: Uint8Array; source: string; captured_at: number | null }; \
              acquireVisualServoFrame(useCachedFrame: boolean, saveSnapshot: boolean, outputDir: string, imageFormat: string, resizeWidth?: number | null, resizeHeight?: number | null): any; \
-             close(): void; pause(millis: number): void; \
+             close(): void; \
              readonly ctiPath: string; readonly serialNumber: string; readonly deviceId: string | null }",
         )
     }
@@ -165,9 +167,9 @@ impl Tool for GenicamClient {
             "acquire3dFrame",
             "getFrameBytes",
             "getFramePayload",
+            "getLiveFrame",
             "acquireVisualServoFrame",
             "close",
-            "pause",
         ]
     }
 
@@ -227,6 +229,7 @@ impl Tool for GenicamClient {
                 _ => Ok(Value::Null),
             },
             "getFramePayload" => self.run_action(ec, "get_frame_payload", None, None),
+            "getLiveFrame" => self.run_action(ec, "get_live_frame", None, None),
             "acquireVisualServoFrame" => self.run_action(
                 ec,
                 "visual_servo_frame",
@@ -242,11 +245,6 @@ impl Tool for GenicamClient {
             ),
             "close" => {
                 self.workers.close(&self.key());
-                Ok(Value::Null)
-            }
-            "pause" => {
-                let millis = json(0).as_u64().unwrap_or_default().min(60_000);
-                std::thread::sleep(Duration::from_millis(millis));
                 Ok(Value::Null)
             }
             _ => Err(Error::new(format!("The GenicamClient tool has no method {method}"))),

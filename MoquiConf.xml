@@ -17,6 +17,8 @@
     <default-property name="genicam.connection.retry.backoff.ms" value="1000"/>
     <default-property name="genicam.connection.fetch.timeout.ms" value="1000"/>
     <default-property name="genicam.multi.process.timeout.ms" value="120000"/>
+    <!-- The longest wait for one answer of a camera's Python worker; the worker is then stopped, its command not sent again. -->
+    <default-property name="genicam.process.timeout.ms" value="120000"/>
     <default-property name="genicam.stream.max.frames" value="100"/>
     <default-property name="genicam.stream.frame.delay.ms" value="66"/>
     <default-property name="genicam.stream.stop.timeout.ms" value="3000"/>
@@ -34,4 +36,8 @@
     <default-property name="genicam.servo.resize.width" value=""/>
     <default-property name="genicam.servo.resize.height" value=""/>
 
+    <tools>
+        <tool-factory class="moqui_genicam::GenicamClientFactory" init-priority="25"/>
+        <tool-factory class="moqui_genicam::GenicamMultiCameraRunnerFactory" init-priority="25"/>
+    </tools>
 </moqui-conf>

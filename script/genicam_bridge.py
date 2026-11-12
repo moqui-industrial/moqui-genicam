@@ -1357,3 +1357,66 @@ def run_action(action, cti_path, serial_number, parameter_names=None, parameters
     except Exception as e:
         update_device_status_to_error(ec, device_id)
         raise e
+
+
+# ---------------------------------------------------------------------------
+# Worker process entry point (MR-Moqui)
+#
+# On MR-Moqui there is no JEP interpreter: the Rust tool GenicamClient starts this module as a worker process and
+# sends one JSON request per line on stdin; each answer is one JSON line on stdout (the log goes to stderr). The
+# worker keeps the module state between requests, as the JEP interpreter did: the camera connections, the streaming
+# threads and the latest frame of each camera. ec is None, so the bridge writes nothing to the database: Moqui stores
+# the DeviceContent references and the device status from the answers.
+# ---------------------------------------------------------------------------
+
+def _encode_value(value):
+    """JSON has no bytes: a buffer goes as {"__base64__": "..."}, which the Rust tool turns back into bytes."""
+    if isinstance(value, (bytes, bytearray)):
+        import base64
+        return {"__base64__": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, dict):
+        return {key: _encode_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_value(item) for item in value]
+    return value
+
+
+def _handle_request(request):
+    if request.get("command") == "close-all":
+        close_all_connections()
+        return {"status": "success"}
+    configure_runtime(request.get("runtime_config"))
+    result = run_action(request.get("action"), request.get("cti_path"), request.get("serial_number"),
+        parameter_names=request.get("parameter_names"), parameters_map=request.get("parameters_map"),
+        ec=None, device_id=request.get("device_id"))
+    return _encode_value(result)
+
+
+def serve():
+    import sys
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            request = {}
+            try:
+                request = json.loads(line)
+                answer = _handle_request(request)
+            except Exception as error:
+                logger.exception("GenICam worker request failed")
+                answer = {"error": str(error)}
+            sys.stdout.write(json.dumps(answer) + "\n")
+            sys.stdout.flush()
+            if request.get("command") == "close-all":
+                break
+    finally:
+        close_all_connections()
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        serve()
+    else:
+        print("Usage: python genicam_bridge.py serve", file=sys.stderr)
+        sys.exit(1)

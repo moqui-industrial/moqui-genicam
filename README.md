@@ -1,257 +1,272 @@
 # moqui-genicam
 
-`moqui-genicam` is a **model-first** and **data-driven** integration component for the Moqui Framework. It provides configuration, control, and data acquisition capabilities for multi-brand vision cameras (e.g., FLIR, Basler, IDS, Baumer) by bridging Moqui's digital twin entity model (`moqui-device`) with the industry-standard **GenICam** framework via **JEP** (Java Embedded Python) and the Python **Harvesters** library.
+`moqui-genicam` connects GenICam vision cameras (FLIR/Teledyne, Basler, IDS, Baumer and others with a GenTL
+producer) to the device model of [moqui-device](https://github.com/moqui/moqui-device). It configures and reads
+cameras, captures images, frame series, video files, multi-camera recordings and 3D (Time-of-Flight) frames, and
+streams live MJPEG to a browser.
 
-JEP embeds Python inside the JVM process. It does **not** spawn a separate operating-system Python process for every script call; each Moqui service call creates or uses a JEP interpreter inside the Java process, and the Python code runs there unless you explicitly orchestrate external processes.
+| Branch | Content |
+|---|---|
+| `master` | The Java/Groovy component for Moqui Java: Groovy classes, and the Python bridge in JEP |
+| `mr-moqui` | This port to [MR-Moqui](https://github.com/moqui/mr-moqui): Rust and JavaScript in place of Groovy |
 
----
+The port follows moqui-device and moqui-device-gateway ([SERVICE-PORT.md](SERVICE-PORT.md)):
 
-## 🌟 Why `moqui-genicam` is Unique
+- **Services.** The services keep their names and parameters, and stay XML Actions.
+- **Groovy scripts.** The work of the services' Groovy scripts, and of the class `GenicamUtil`, is the JavaScript
+  library `service/moqui/genicam/Genicam.js`.
+- **Groovy classes.** The classes that talk to the camera are Rust tools:
+  - `GenicamClient`, for one camera;
+  - `GenicamMultiCameraRunner`, for a multi-camera recording.
+- **Python.** The camera side stays Python (`script/genicam_bridge.py`, `script/multi_camera_capture.py`):
+  Harvesters and the vendor's GenTL producer are what the camera SDK provides.
 
-Unlike typical IP camera streams (e.g. RTSP/ONVIF) or standard wrapper libraries that treat vision cameras as simple video feeds, `moqui-genicam` is designed from the ground up for **industrial automation** and **advanced machine vision**:
+## Model
 
-1. **Model-First Digital Twin**: The camera's settings, capabilities, and registers are not hardcoded. They are declared in Moqui's database using the `moqui-device` and `moqui-math` schemas (see the component `data` and `entity` folders). Changes to exposure, triggers, or frame rates require zero code modifications.
-2. **Zero-Copy & Zero Graphics Pipelines**: Raw image buffers and Time-of-Flight (ToF) coordinate maps are processed directly in memory. They bypass traditional OpenCV/Java graphics libraries, converting buffers straight into structured NumPy arrays (no unnecessary BGR conversions) and saving them as `.npy` binaries.
-3. **Seamless Interoperability**: Combining the performance of Moqui's Java transactional engine with the data-science power of Python's scientific stack (NumPy, OpenCV) via Java Embedded Python (JEP) allows low-latency, thread-safe hardware access.
-4. **Declarative XML Services**: Operations are organized via standard Moqui XML-actions. Database transactions, file cleanups, and camera status changes are executed declaratively with standard validation and logging.
+The cameras are moqui-device data, with no camera code in the model:
 
----
+- **Camera model and camera.** The camera model is a `Device`. A connected camera is a `Device` with a
+  `PhysicalDevice`, whose `serialNumber` is the camera's serial number.
+- **Driver.** `DeviceConnection` uses the driver `DcdGenicam`:
+  - `transportConfig` is the path of the `.cti` GenTL producer;
+  - `options` can set `serial=...`, which takes precedence over the `PhysicalDevice` serial number.
+- **Nodes.** The camera's GenICam nodes (`ExposureTime`, `Gain`, `TriggerMode`, ...) are `ParameterDef` and
+  `Parameter` rows of moqui-math. A `DeviceRequest` reads or writes them, with the node name in
+  `DeviceRequestItem.query`.
+- **Status.** The camera's status follows `GenicamCameraStatusFlow` of moqui-device.
 
-## 🛠️ Core Features & 3D/ToF Integration
+`data/GenicamData.xml` (seed) adds the device type `DtVisionCamera`, the driver `DcdGenicam`, the item type
+`DritString` and the job `clean_GenICamTensors_daily`. `data/GenicamTestData.xml` (test) holds:
 
-### 1. 3D & Time-of-Flight (ToF) Spatial Imaging
-The driver incorporates complete support for **GenDC (GenICam Data Container) Multi-Part payloads** (Payload Types 6 and 7):
-* **Component Extraction**: Automatically scans multi-part buffers to isolate spatial components (containing `Coord3D_ABC32f` or `Coord3D_C32f` formats).
-* **Buffer-to-Tensor Conversion**: Raw binary buffers representing spatial 3D points are converted directly into NumPy float32 arrays (shape: `[Height, Width, 3]` representing $X, Y, Z$ spatial coordinates).
-* **Binary Serialization**: Decoded arrays are serialized into standard `.npy` binary files using in-memory streams, bypassing standard image conversions that discard spatial precision.
+- the mock camera `FLIR_CAMERA_1`;
+- two real FLIR cameras for manual tests;
+- the requests `FLIR_ReadState`, `FLIR_TriggerShot`, `FLIR_StartStreaming`, `FLIR_StopStreaming` and
+  `FLIR_GetFrame`.
 
-```mermaid
-flowchart LR
-    Camera[(ToF Camera)] -->|GenDC Payload| Harvesters[Harvesters Library]
-    Harvesters -->|Multi-Part Buffer| Bridge[genicam_bridge.py]
-    Bridge -->|Extract Spatial Component| ABC[Coord3D ABC32f]
-    ABC -->|Reshape to XYZ Array| NumPy[NumPy float32 Array]
-    NumPy -->|Save Memory Stream| NpyFile[tensor_ID.npy]
-```
+## Services
 
-### 2. Transactional Database Persistence (`moqui.math.Tensor`)
-When a 3D frame is captured, `moqui-genicam` integrates the frame directly into Moqui's database using the `moqui-math` Tensor schemas:
-* **Tensor Entity**: Saves a new `moqui.math.Tensor` record storing type (`TtDense`), purpose (`TpImageRep`), rank (3), and dimensions (e.g. `[480, 640, 3]`).
-* **Axis Definitions**: Dynamically creates `moqui.math.TensorAxis` records defining dimensions and strides:
-  * Axis 0: Height (`TapHeight` / `Y`)
-  * Axis 1: Width (`TapWidth` / `X`)
-  * Axis 2: Channels (`TapChannel` / `C` - coordinates $A, B, C$)
-* **Content Record**: Creates a `moqui.math.TensorContent` record pointing to the `.npy` file location on disk.
-* **Transactional Guarantee**: Database entries and disk writes are bound to a single transaction via JEP. If the file write or DB record creation fails, the transaction rolls back cleanly.
+All are in `moqui.genicam.GenicamServices`.
 
-### 3. Resilient Fail-Safe & Status Transitions
-To protect industrial workflows, camera connection and acquisition errors trigger automatic state changes:
-* **Error Interception**: If a camera times out, disconnects, or fails to initialize, JEP intercepts the exception.
-* **State Transition**: The `moqui.device.Device` record status is automatically transitioned to `DbsErrorStop` via Moqui Entity API directly from the Python bridge.
-* **Backoff Retry**: Persistent connection attempts are retried up to 3 times with exponential backoff (1s, 2s, 4s) before declaring a hardware failure.
+| Service | Use |
+|---|---|
+| `run#GenICamRequest` | The `runServiceName` of a GenICam `DeviceRequest`, called by `moqui.device.DeviceServices.run#DeviceRequest`. `DrtRead` reads the nodes of the request items; `DrtWrite` writes the values of their Parameters. The values the camera answers are stored with `DeviceAcquisitionServices.store#Samples`, as for every other driver: current Parameter values, and `ParameterLog` rows for a `DrpLogging` request |
+| `acquire#SingleImage` | One frame as a jpg, png or bmp file, registered as a `DeviceContent` (`DCntImage`) |
+| `acquire#VideoStream` | `numFrames` frames as image files, each a `DeviceContent` |
+| `acquire#VideoFile` | An avi or mp4 file of `numFrames` frames at `fps` |
+| `acquire#MultiVideoFile` | A video file on each camera of `deviceIdList` at the same time, each camera in a Python process of its own |
+| `acquire#VisualServoFrame` | One frame for a visual servoing loop: the latest frame of the streaming thread, or a new capture, with its bytes and capture time; optionally saved as a `DeviceContent` |
+| `stream#LiveMjpeg` | A `multipart/x-mixed-replace` response of `maxFrames` JPEG frames, one every `frameDelayMs`, each sent as it is written. Needs a web request and an authenticated user: the servlet `script/GenicamStreamServlet.js` (see Live MJPEG) |
+| `acquire#GenICam3DFrame` | A GenDC 3D frame as a moqui-math `Tensor`, with one `TensorAxis` per dimension and the NPY file as `TensorContent` |
+| `clean#GenICamTensors` | Deletes the 3D frames older than `daysToKeep`: NPY file, `TensorContent`, `TensorAxis` and `Tensor`, one transaction per tensor. The job `clean_GenICamTensors_daily` runs it at 02:00 |
 
-### 4. Scheduled Tensor Maintenance (Daily ServiceJob)
-High-frame-rate 3D cameras generate massive amounts of data. `moqui-genicam` includes a background cleanup engine to prevent disk space exhaustion:
-* **Daily Cron Job**: A scheduled job named `clean_GenICamTensors_daily` runs every day at 02:00 AM (`0 0 2 * * ?`).
-* **Declarative Service**: Invokes the [clean#GenICamTensors](file:///C:/Users/igorg/Desktop/moqui-genicam-test/moqui-framework/runtime/component/moqui-genicam/service/moqui/genicam/GenicamServices.xml) service.
-* **Safe Deletion Loop**: Locates all `TCntNpy` tensors older than the configured threshold (default: 30 days), deletes their physical `.npy` files, and clears matching `Tensor`, `TensorAxis`, and `TensorContent` DB entries in isolated, individual transactions to prevent row locking.
-
----
-
-## 📋 Standard Architecture & Services
-
-The component implements the standard `moqui.device.DeviceServices.run#DeviceRequest` interface.
+A camera failure sets the `Device` to `DbsErrorStop`, as the Python bridge did in the Java version. The service then
+returns the error.
 
 ```mermaid
 flowchart TD
-    Client[Client / Job / Screen] -->|Call run#DeviceRequest| Request[DeviceRequest Record]
-    Request -->|Resolve Connection| Conn[DeviceConnection]
-    Conn -->|Route to Driver Service| Service[GenicamServices - run#GenICamRequest]
-    Service -->|Validate Params & CTI Path| XML[XML-actions Validations]
-    XML -->|Launch Jep Interpreter| Jep[Java Embedded Python]
-    Jep -->|Execute Action| Python[genicam_bridge.py]
-    Python -->|Access Nodemap| Camera[(Physical Camera)]
-    Python -->|Return Results Map| Jep
-    Jep -->|Sync DB Parameters| DB[(H2/MySQL Database)]
+    Caller[Screen / job / service] -->|run#DeviceRequest or acquire#...| Services[GenicamServices.xml<br/>XML Actions]
+    Services -->|execute| Library[Genicam.js]
+    Library -->|ec.getTool GenicamClient| Tool[Rust tool GenicamClient]
+    Tool -->|JSON lines| Worker[Python worker<br/>genicam_bridge.py]
+    Worker -->|Harvesters + GenTL .cti| Camera[(Camera)]
+    Library -->|store#Samples, DeviceContent, Tensor| DB[(Moqui database)]
 ```
 
-### Services Summary
+## Rust tools and Python workers
 
-| Service Name | Purpose | Key Attributes |
-| :--- | :--- | :--- |
-| `run#GenICamRequest` | Processes read/write commands (e.g. exposure, triggers) | `transaction="ignore"` |
-| `acquire#SingleImage` | Captures one frame and saves it to disk as `.jpg`, `.bin`, or `.npy` | `transaction="ignore"` |
-| `acquire#VideoStream` | Asynchronously captures a number of 2D/JPEG frames | `transaction="ignore"` |
-| `acquire#VideoFile` | Records a short `.avi` or `.mp4` video file from the camera | `transaction="ignore"` |
-| `acquire#MultiVideoFile` | Coordinates multi-camera video captures using separate worker processes | `transaction="ignore"` |
-| `stream#LiveMjpeg` | Pushes live MJPEG stream to web browsers via HTTP | `transaction="ignore"` |
-| `acquire#GenICam3DFrame` | Decodes a GenDC 3D frame and persists it as a DB Tensor | `transaction="ignore"` |
-| `clean#GenICamTensors` | Deletes old 3D tensor files and database records | `transaction="ignore"` |
+- **Workers.** In the Java version the bridge ran in a JEP interpreter inside the JVM. Here the tool `GenicamClient`
+  runs it as a Python worker process, one per camera (CTI path and serial number). The worker is started at the
+  first call and kept, so the camera connection, the streaming thread and the latest frame live between calls, as
+  they did in the interpreter.
+- **Concurrency.** Calls to one camera wait for each other; calls to different cameras do not.
+- **Timeouts.** `genicam.process.timeout.ms` (120 s by default) limits one answer of the worker. A call that times
+  out stops the worker, and its command is not sent again, since a write or a trigger may already have reached the
+  camera. The next call starts a new worker.
+- **Data exchange.** Requests and answers are JSON lines. Byte buffers travel as base64 and are bytes again in Moqui.
+- **Database writes.** The worker has no execution context, so it does not write to the database. The `DeviceContent`
+  rows, the Tensor rows and the error status are written by `Genicam.js`.
+- **Python interpreter.** The tool uses `runtime/python_venv` as the Java version did; otherwise the `PYTHON`
+  environment variable, or `python3`/`python` on the `PATH`.
 
----
+## Installation
 
-## 🗂️ Component Directory Layout
+1. **Clone the components.** Put this repository at `runtime/component/moqui-genicam` of MR-Moqui, with moqui-device
+   and moqui-math on their `mr-moqui` branches. The crate uses the framework's `moqui-core` and `moqui-lib` through
+   relative paths.
+2. **Build:**
+   ```sh
+   ./moq build
+   ```
+3. **Install the Python packages** of `requirements.txt` (NumPy, OpenCV, Harvesters) in `runtime/python_venv`:
+   ```sh
+   python3 -m venv runtime/python_venv
+   runtime/python_venv/bin/pip install -r runtime/component/moqui-genicam/requirements.txt
+   ```
+4. **Install the camera vendor's GenTL producer.** For FLIR/Teledyne cameras this is the Spinnaker SDK, for
+   example:
+   - `/opt/spinnaker/lib/spinnaker-gentl/Spinnaker_GenTL.cti` on Linux;
+   - `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\Spinnaker_GenTL_v140.cti` on Windows.
 
-*   `component.xml`: Declares dependencies on `moqui-math`, `moqui-device`, and `moqui-jep`.
-*   `build.gradle`: Manages builds and testing libraries.
-*   `MoquiConf.xml`: Defines default output paths, image format, video container/codec, and optional resize settings.
-*   `data/GenicamData.xml`: Defines the scheduled cleanup `ServiceJob`.
-*   `data/GenicamTestData.xml`: Contains test camera definitions, connection configurations, and test requests.
-*   `script/genicam_bridge.py`: Core Python bridge code (connecting Harvesters, decoding GenDC, converting pixel formats, and handling transactional persistence).
-*   `service/moqui/genicam/GenicamServices.xml`: Declares Moqui services refactored using standard declarative XML-actions.
-*   `src/test/groovy/GenicamServiceTests.groovy`: Spock integration tests covering reads, writes, streams, 3D frame capture, error transitions, and daily cleanups.
-*   `requirements.txt`: Declares required Python packages (NumPy/OpenCV/Harvesters availability is provided via the Moqui JEP runtime or this component's `requirements.txt`).
+   Put its path in `DeviceConnection.transportConfig`.
+5. **Load the data:**
+   ```sh
+   ./moq load types=seed,seed-initial
+   ```
 
----
+### Simulation
 
-## 🚀 Testing & Verification
+Without Harvesters or without the `.cti` file, the bridge simulates the camera. It does the same for the serial
+number `FLIR_CAMERA_1` and for any serial containing `mock`. This is the behaviour of the Python bridge, which
+belongs to the camera side and is unchanged. Check the connection on a real installation: a missing driver is not
+reported as an error.
 
-> [!NOTE]
-> The test suite uses the simulated fallback mode if no real hardware is available or if the `.cti` driver file is missing, making it completely safe to run in automated CI/CD environments.
+## Configuration
 
-To run the integration tests (Windows):
-```bash
-.\gradlew.bat :runtime:component:moqui-genicam:test --no-daemon
+These are the default properties of `MoquiConf.xml`. A service parameter of the same meaning takes precedence.
+
+| Property | Default | Use |
+|---|---|---|
+| `genicam.images.path`, `.frames.path`, `.videos.path`, `.servo.path`, `.tensors.path` | `runtime/genicam/...` | Output directories (relative to the runtime directory) |
+| `genicam.image.format` | `jpg` | `jpg`, `png` or `bmp` |
+| `genicam.video.container`, `genicam.video.codec` | `avi`, `MJPG` | `avi`/`mp4`; `MJPG`, `XVID` or `mp4v` |
+| `genicam.frames.default.numFrames`, `genicam.videos.default.numFrames`, `genicam.videos.default.fps` | `10`, `60`, `15.0` | Frame counts and rate |
+| `genicam.<images,frames,videos,servo>.resize.width/height` | empty | Resize of the frames |
+| `genicam.connection.retry.count`, `.retry.backoff.ms`, `.fetch.timeout.ms` | `3`, `1000`, `1000` | Connection retries with exponential backoff, and the frame fetch timeout |
+| `genicam.stream.max.frames`, `genicam.stream.frame.delay.ms` | `100`, `66` | Live MJPEG |
+| `genicam.stream.stop.timeout.ms`, `genicam.stream.mock.frame.delay.ms` | `3000`, `100` | Streaming thread |
+| `genicam.servo.default.useCachedFrame`, `.saveSnapshot`, `genicam.servo.buffer.source`, `genicam.servo.max.frame.age.ms` | `true`, `false`, `latest`, `250` | Visual servoing |
+| `genicam.process.timeout.ms` | `120000` | The longest wait for an answer of a camera's worker |
+| `genicam.multi.process.timeout.ms` | `120000` | The longest multi-camera recording |
+
+## Live MJPEG
+
+`stream#LiveMjpeg` writes its response frame by frame. On MR-Moqui a response goes out while it is written only from a
+render or from a servlet script; a screen transition sends it whole at the end. The component ships the servlet
+`script/GenicamStreamServlet.js`, and the application declares it in its conf, in the `webroot` webapp.
+
+When a webapp declares a servlet it no longer gets the default ones, so the conf declares them too:
+
+```xml
+<webapp-list>
+    <webapp name="webroot">
+        <servlet name="MoquiServlet" class="org.moqui.impl.webapp.MoquiServlet"><url-pattern>/*</url-pattern></servlet>
+        <servlet name="MoquiFopServlet" class="org.moqui.impl.webapp.MoquiFopServlet"><url-pattern>/fop/*</url-pattern></servlet>
+        <servlet name="GenicamStream" location="component://moqui-genicam/script/GenicamStreamServlet.js">
+            <url-pattern>/genicam/stream</url-pattern>
+        </servlet>
+    </webapp>
+</webapp-list>
 ```
 
-To run the integration tests (Linux/macOS):
-```bash
-./gradlew :runtime:component:moqui-genicam:test --no-daemon
+The users who watch need permission on the service `moqui.genicam.GenicamServices.stream#LiveMjpeg`, for example an
+`ArtifactGroupMember` (`AT_SERVICE`) of an `ArtifactGroup` granted to their user group. A browser of a signed-in user
+then shows the camera with:
+
+```html
+<img src="/genicam/stream?deviceId=FLIR_CAMERA_1&amp;maxFrames=300&amp;frameDelayMs=66" alt="Camera">
 ```
 
-> [!TIP]
-> To configure real hardware, update the `DeviceConnection` records in your database to point to your physical GenTL driver (examples):
->
-> - Windows example: `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\Spinnaker_GenTL_v140.cti`
-> - Linux example: `/opt/vendor/cti/Spinnaker_GenTL_v140.cti`
->
-> Then set your camera's real serial number in the connection options.
+| Parameter | Use |
+|---|---|
+| `deviceId` | The camera (required) |
+| `connectionName` | One of the camera's connections, else its own |
+| `maxFrames` | The frames to send (`genicam.stream.max.frames`, 100) |
+| `frameDelayMs` | The pause between frames (`genicam.stream.frame.delay.ms`, 66) |
 
-For direct acquisition tests against a connected FLIR camera, the most useful services are:
+- **Source of the frames.** The frames are the latest frames of the camera's streaming thread. Start it first with a
+  `DrtWrite` of `AcquisitionStart`, as the request `FLIR_StartStreaming` does.
+- **Disconnected clients.** A script cannot see that the client went away, so a stream always ends after `maxFrames`
+  frames, as the Java version did. Set `maxFrames` to the length of the view and reload the image to go on.
+- **Request deadline.** A script on a request thread stops at the request deadline (`webapp_request_timeout`, 300 s):
+  keep `maxFrames` × `frameDelayMs` below it.
+- **Threads and workers.** Each viewer holds a request thread while the stream lasts, and the viewers of one camera
+  share its worker.
 
-```text
-moqui.genicam.GenicamServices.acquire#SingleImage
-moqui.genicam.GenicamServices.acquire#VideoFile
-moqui.genicam.GenicamServices.acquire#MultiVideoFile
-moqui.genicam.GenicamServices.acquire#VideoStream
-```
+## Multi-camera recording
 
-Typical parameters:
-
-```text
-deviceId=FLIR_CAMERA_1
-connectionName=FlirCameraConnection
-outputDir=runtime/genicam/captured_images   # or runtime/genicam/videos
-numFrames=120
-fps=15.0
-```
-
-Default media configuration is resolved from `MoquiConf.xml`, with optional per-service overrides:
-
-```text
-genicam.images.path
-genicam.frames.path
-genicam.videos.path
-genicam.servo.path
-genicam.tensors.path
-genicam.image.format        # jpg, png, bmp
-genicam.video.container     # avi, mp4
-genicam.video.codec         # MJPG, XVID, mp4v
-genicam.frames.default.numFrames
-genicam.videos.default.numFrames
-genicam.videos.default.fps
-genicam.connection.retry.count
-genicam.connection.retry.backoff.ms
-genicam.connection.fetch.timeout.ms
-genicam.stream.max.frames
-genicam.stream.frame.delay.ms
-genicam.stream.stop.timeout.ms
-genicam.stream.mock.frame.delay.ms
-genicam.servo.default.useCachedFrame
-genicam.servo.default.saveSnapshot
-genicam.servo.buffer.source
-genicam.servo.max.frame.age.ms
-genicam.multi.process.timeout.ms
-```
-
-## Ubuntu And Container Notes
-
-For Ubuntu deployments, prefer running one camera-facing Moqui container per physical camera or per small camera group. This avoids GenTL/Harvesters contention inside a single process and matches the most reliable real-hardware tests.
-
-Operational recommendations:
-
-```text
-1. Install the vendor GenTL/SDK package inside the image or mount it read-only.
-2. Expose the CTI path through DeviceConnection.transportConfig.
-3. Install Python dependencies from requirements.txt in the same container used by Moqui/JEP.
-4. Persist runtime/genicam/images, frames, videos, servo, and tensors on mounted volumes.
-5. Keep one stable network interface and MTU profile per GigE camera group.
-6. Use AVI/MJPG as the safest default for operator playback compatibility.
-```
-
-Example container concerns:
-
-```text
-- mount CTI/SDK files: /opt/vendor/cti
-- mount output volumes: /opt/moqui/runtime/genicam/*
-- set timezone and locale explicitly
-- keep container CPU pinned when low-latency servo loops matter
-- if multiple cameras are needed, prefer multiple containers over many in-process threads
-```
-
-## Multi-Camera Coordinator
-
-`acquire#MultiVideoFile` is the explicit service-level coordinator for parallel multi-camera recording. The service resolves each `Device` and `DeviceConnection` in Moqui, then launches one external Python worker process per camera so that camera SDK state is isolated at the operating-system process level.
-
-Typical usage:
+`acquire#MultiVideoFile` finds each `Device` and its `DeviceConnection`. The tool `GenicamMultiCameraRunner` then runs
+`script/multi_camera_capture.py`, which starts a Python process per camera, so the SDK state of each camera is
+separate.
 
 ```text
 deviceIdList=["CAMERA_A","CAMERA_B"]
-connectionNameList=["ConnA","ConnB"]    # optional
+connectionNameList=["ConnA","ConnB"]    # optional, by index
 numFrames=120
 fps=10.0
-outputDir=runtime/genicam/videos
-videoContainer=avi
-videoCodec=MJPG
 ```
 
-Returned data:
+It returns:
+
+- `captureResults`, one per camera;
+- `successfulCount`;
+- `failedCount`.
+
+## Visual servoing
+
+`acquire#VisualServoFrame` returns `capturedAt` in Unix seconds, so a loop can drop frames that are too old:
 
 ```text
-captureResults
-successfulCount
-failedCount
+1. Start the camera's streaming thread (a DrtWrite of AcquisitionStart, as FLIR_StartStreaming).
+2. Take the latest frame: acquire#VisualServoFrame(useCachedFrame=true).
+3. Drop it when it is older than the latency budget (genicam.servo.max.frame.age.ms).
+4. Run the vision model on it, send the correction to the robot or PLC.
+5. Repeat at a fixed cycle time.
 ```
 
-## Visual Servoing Pattern
+The latest frame wins, with no queue. When the cached frame is stale, take a new one with `useCachedFrame=false`.
+Obstacle detection and camera-to-robot calibration are separate stages of the application. The
+[ONNX trajectory example](https://github.com/moqui/moqui-device/tree/mr-moqui/examples/onnx-obstacle) of moqui-device
+shows the planner side.
 
-Recommended loop:
+## 3D and Time-of-Flight frames
 
-```text
-1. Start streaming/caching for the camera.
-2. Pull the latest cached frame with acquire#VisualServoFrame(useCachedFrame=true).
-3. Reject frames older than the configured latency budget.
-4. Run vision inference on the cached frame only.
-5. Send robot/PLC correction.
-6. Repeat at a fixed cycle time.
+The bridge reads GenDC multi-part payloads (payload types 6 and 7):
+
+1. It takes the spatial component (`Coord3D_ABC32f` or `Coord3D_C32f`).
+2. It turns the component into a float32 NumPy array of shape `[height, width, 3]`.
+3. It serializes the array as an NPY file.
+
+`acquire#GenICam3DFrame` stores the frame as:
+
+- a `Tensor`: `TtDense`, `TpImageRep`, rank 3, with the shape;
+- one `TensorAxis` per dimension: `TapHeight`/Y, `TapWidth`/X, `TapChannel`/C;
+- a `TensorContent` (`TCntNpy`) with the file location.
+
+The file and the rows are not one transaction. `clean#GenICamTensors` only deletes tensors named
+`GenICam 3D Frame - Camera ...` whose file is under `genicam.tensors.path`.
+
+## Deployment notes
+
+- **Container layout.** Run one camera-facing Moqui instance per camera, or per small group of cameras: GenTL
+  producers do not always share a process well.
+- **Mounts.** Mount the vendor SDK (for example `/opt/spinnaker`) read-only, and the `runtime/genicam` directories on
+  persistent volumes.
+- **GigE cameras.** Keep one network interface and MTU profile per camera group.
+- **Video.** AVI/MJPG is the most portable video format.
+
+## Tests
+
+See [test/README.md](test/README.md).
+
+```sh
+./moq test moqui-genicam
 ```
 
-Practical buffering pattern:
+The tests use the mock camera: no camera, SDK or Harvesters is needed, but NumPy and OpenCV are.
 
-```text
-- buffer strategy: latest-wins
-- producer: background acquisition thread updates the latest frame cache
-- consumer: servo loop reads one frame snapshot without queue buildup
-- latency control: cap camera fetch timeout and consumer cycle time
-- fallback: if cache is stale, reacquire with useCachedFrame=false
-```
+## Layout
 
-Suggested latency policy:
-
-```text
-- servo buffer source: latest
-- servo max frame age: 100-250 ms
-- stream frame delay: tuned to the control-loop budget
-- do not let image queues grow unbounded
-- prefer dropping old frames rather than processing stale ones
-```
+| Path | Content |
+|---|---|
+| `service/moqui/genicam/GenicamServices.xml` | The services (XML Actions) |
+| `service/moqui/genicam/Genicam.js` | Their logic: the Groovy scripts and `GenicamUtil` of the Java version |
+| `src/client.rs` | Tool `GenicamClient` (Groovy `GenicamClient`) |
+| `src/multi_camera.rs` | Tool `GenicamMultiCameraRunner` (Groovy `GenicamMultiCameraRunner`) |
+| `src/worker.rs` | The Python worker processes, in place of the JEP interpreter |
+| `script/genicam_bridge.py` | The camera: Harvesters, GenDC decoding, image and video encoding, streaming thread, mock camera |
+| `script/multi_camera_capture.py` | The multi-camera recording processes |
+| `script/GenicamStreamServlet.js` | The live MJPEG servlet, declared by the application's conf |
+| `data/` | Seed data and test data |
+| `test/` | The regression tests |
+| `MoquiConf.xml` | The default properties and the tool factories |
+| `requirements.txt` | The Python packages |

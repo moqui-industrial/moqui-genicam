@@ -1,7 +1,15 @@
-build/
-.gradle/
+# Native component build artifacts
+/target/
+/Cargo.lock
+
+# Python bytecode
 __pycache__/
-*.class
-bin/
-lib/
-runtime/
+
+# Files the services write at run time (the mock camera state is versioned)
+runtime/*
+!runtime/genicam/
+runtime/genicam/*
+!runtime/genicam/mock_camera_state.json
+
+# Local Gradle state of the Java build of the master branch
+.gradle/

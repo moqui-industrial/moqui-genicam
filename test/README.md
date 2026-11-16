@@ -3,7 +3,7 @@
 `Genicam.spec.js` holds the tests of the Java version (`GenicamServiceTests.groovy`) on MR-Moqui. They use the mock
 camera `FLIR_CAMERA_1` of `data/GenicamTestData.xml`, which the Python bridge simulates, so they need:
 
-- MR-Moqui with moqui-device, moqui-math and this component on their `mr-moqui` branches in `runtime/component`;
+- MR-Moqui with moqui-device, moqui-math and this component on their `mr-moqui` branches in `runtime/components/addon`;
 - a Python with NumPy and OpenCV: `runtime/python_venv`, `PYTHON`, or `python3` on the `PATH`.
 
 They do not need a camera, a camera SDK, Harvesters or Mantle.

@@ -90,7 +90,7 @@ flowchart TD
 
 ## Installation
 
-1. **Clone the components.** Put this repository at `runtime/component/moqui-genicam` of MR-Moqui, with moqui-device
+1. **Clone the components.** Put this repository at `runtime/components/addon/moqui-genicam` of MR-Moqui, with moqui-device
    and moqui-math on their `mr-moqui` branches. The crate uses the framework's `moqui-core` and `moqui-lib` through
    relative paths.
 2. **Build:**
@@ -100,7 +100,7 @@ flowchart TD
 3. **Install the Python packages** of `requirements.txt` (NumPy, OpenCV, Harvesters) in `runtime/python_venv`:
    ```sh
    python3 -m venv runtime/python_venv
-   runtime/python_venv/bin/pip install -r runtime/component/moqui-genicam/requirements.txt
+   runtime/python_venv/bin/pip install -r runtime/components/addon/moqui-genicam/requirements.txt
    ```
 4. **Install the camera vendor's GenTL producer.** For FLIR/Teledyne cameras this is the Spinnaker SDK, for
    example:

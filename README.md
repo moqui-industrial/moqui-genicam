@@ -122,7 +122,11 @@ reported as an error.
 
 ## Configuration
 
-These are the default properties of `MoquiConf.xml`. A service parameter of the same meaning takes precedence.
+These are the attributes of the `<genicam>` element of `MoquiConf.xml`, named below by their former property names:
+`genicam.frames.default.numFrames` is the attribute `frames-default-num-frames`, read as
+`ec.factory.getConfValue("genicam@frames-default-num-frames")` and overridden from the environment as
+`moqui_conf__genicam__frames_default_num_frames` (`moqui conf env`). A service parameter of the same meaning takes
+precedence.
 
 | Property | Default | Use |
 |---|---|---|

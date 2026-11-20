@@ -44,7 +44,7 @@ along with this software (see the LICENSE.md file). If not, see
     </transition>
 
     <actions>
-        <set field="refreshMs" from="Math.max(parseInt(String(System.getProperty('genicam.live.refresh.ms') || '500'), 10) || 500, 50)"/>
+        <set field="refreshMs" from="Math.max(parseInt(String(ec.factory.getConfValue('genicam@live-refresh-ms') || '500'), 10) || 500, 50)"/>
     </actions>
 
     <widgets>

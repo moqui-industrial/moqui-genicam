@@ -275,8 +275,33 @@ fn bridge_script(ec: &ExecutionContext) -> Result<PathBuf, Error> {
     component_script(ec, BRIDGE_SCRIPT)
 }
 
+/// A setting of the `<genicam>` element of MoquiConf.xml, by its old property name: `genicam.process.timeout.ms` is
+/// `genicam@process-timeout-ms` (overridden from the environment as `moqui_conf__genicam__process_timeout_ms`).
 fn property(name: &str) -> Option<String> {
-    Some(moqui_lib::env::get_prop_or_env(name).trim().to_string()).filter(|value| !value.is_empty())
+    let value = moqui_core::context::conf_env::setting_or_property(&conf_selector(name));
+    Some(value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
+/// The conf selector of a setting's old property name.
+pub(crate) fn conf_selector(name: &str) -> String {
+    let mut attribute = String::new();
+    let mut previous_lower = false;
+    for ch in name.strip_prefix("genicam.").unwrap_or(name).chars() {
+        if ch == '.' {
+            attribute.push('-');
+            previous_lower = false;
+        } else if ch.is_ascii_uppercase() {
+            if previous_lower {
+                attribute.push('-');
+            }
+            attribute.push(ch.to_ascii_lowercase());
+            previous_lower = false;
+        } else {
+            attribute.push(ch);
+            previous_lower = ch.is_ascii_lowercase();
+        }
+    }
+    format!("genicam@{attribute}")
 }
 
 pub(crate) fn property_number(name: &str) -> Option<u64> {

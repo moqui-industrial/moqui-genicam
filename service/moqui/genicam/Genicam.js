@@ -37,9 +37,11 @@ const blank = value => value == null || String(value).trim() === ""
 
 // ---------- GenicamUtil: configuration ----------
 
-// A default-property of MoquiConf.xml (or a system property or environment variable of the same name).
+// A setting of the <genicam> element of MoquiConf.xml, by its old property name: genicam.frames.default.numFrames is
+// genicam@frames-default-num-frames (overridden from the environment as moqui_conf__genicam__frames_default_num_frames).
+const confSelector = name => "genicam@" + name.replace(/^genicam\./, "").replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase().replace(/\./g, "-")
 function configProperty(name, defaultValue) {
-    const value = System.getProperty(name)
+    const value = ec.factory.getConfValue(confSelector(name))
     return blank(value) ? defaultValue : String(value).trim()
 }
 
